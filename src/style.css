@@ -1,0 +1,312 @@
+:root {
+  --bg: #141821;
+  --panel: #1c2230;
+  --border: #2e3648;
+  --text: #e8ecf4;
+  --text-dim: #8b93a7;
+  --accent: #5ac8fa;
+  --accent-dim: #2a4a56;
+  --good: #4ade80;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+#app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem 1rem 3rem;
+  gap: 1.25rem;
+}
+
+button {
+  font-family: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+/* Header */
+
+.app-header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.dictionary-status {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.dictionary-status.error {
+  color: var(--bad);
+}
+
+/* Scanner + results layout */
+
+.board-and-results {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+@media (min-width: 720px) {
+  .board-and-results {
+    grid-template-columns: minmax(260px, 480px) 1fr;
+  }
+}
+
+/* Results */
+
+.results {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  min-height: 200px;
+}
+
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.results-summary {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.heatmap-toggle {
+  flex-shrink: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.heatmap-toggle:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.heatmap-toggle.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.results-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.result-word {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.35rem 0.6rem;
+}
+
+.result-word .points {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.result-word.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.result-word.active .points {
+  color: var(--accent);
+}
+
+/* Benchmark page (benchmark.html) */
+.benchmark-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.benchmark-table th,
+.benchmark-table td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.benchmark-table th {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.benchmark-table .numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.benchmark-table .note {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+/* Live scanner (scanner.ts) */
+.scanner-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  /* Stays put once scrolled past — see .scanner-panel--compact below for the
+     shrink that happens at the same time. */
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  padding-bottom: 0.5rem;
+}
+
+.scanner-stage {
+  position: relative;
+  /* Width and height are set as explicit pixel values by scanner.ts
+     (computeStageSize/applyStageSize), always in the same 3:4 ratio for
+     both the natural and compact sizes — see the comment there for why
+     this moved out of CSS aspect-ratio/max-height. max-width is just a
+     safety net against a stale inline size briefly exceeding its column
+     before JS runs. */
+  max-width: 100%;
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #000;
+  transition:
+    width 0.3s ease,
+    height 0.3s ease;
+}
+
+/* Hide non-essential chrome once compact so the shrunken board doesn't also
+   have to make room for controls under it. */
+.scanner-panel--compact .scanner-diagnostics {
+  display: none;
+}
+
+.scanner-stage video,
+.scanner-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.scanner-stage video {
+  object-fit: cover;
+}
+
+/* The overlay must never intercept touches meant for the preview, and must
+   never be a surface the capture path reads from — see scanner.ts. */
+.scanner-stage canvas {
+  pointer-events: none;
+}
+
+/* The flattened board (boardView.ts). Starts corner-pinned onto the live
+   quad via a JS-set matrix3d, then animates to `transform: none` — the
+   transform-origin has to be the box's own top-left, or the corner-pin math
+   (which assumes it) draws the wrong quad. */
+.scanner-board {
+  transform-origin: 0 0;
+  background: #000;
+}
+
+/* Per-cell point heatmap, drawn between the board and the word trail. */
+.scanner-heatmap {
+  z-index: 1;
+}
+
+/* Word-trail overlay, drawn in the flattened board's own grid space. */
+.scanner-trail {
+  z-index: 2;
+}
+
+.scanner-status {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.6rem 0.9rem;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+  color: var(--text);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.scanner-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.scanner-actions button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 1rem;
+}
+
+.scanner-error {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.1);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+/* On-screen diagnostics: there is no console on a phone. */
+.scanner-diagnostics {
+  margin: 0;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}

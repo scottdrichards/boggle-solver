@@ -1,0 +1,32 @@
+{
+  "name": "boggle-solver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "npm run build:wordlist && npm run copy:wasm",
+    "dev": "vite",
+    "prebuild": "npm run build:wordlist && npm run copy:wasm",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "pretest": "npm run build:wordlist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
+    "build:wordlist": "tsx scripts/buildWordlist.ts",
+    "copy:wasm": "tsx scripts/copyWasm.ts"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "an-array-of-english-words": "^2.0.0",
+    "tsx": "^4.23.8",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

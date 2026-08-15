@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-ssr
+public/wordlist.trie.bin
+public/tfjs-wasm
+*.local
+.DS_Store
+*.tsbuildinfo
