@@ -30,6 +30,7 @@
 import { CONFIDENT_INLIERS } from "../cv/gridDetector";
 import { sliceIntoCells, warpQuadToSquare, type PixelBuffer, type Point } from "../cv/quadWarp";
 import { getClassifier, getDetector, prefetchModels } from "../ml/models";
+import type { Prediction } from "../ml/classifier";
 import { activeBackend, tensorMemory } from "../ml/backend";
 import { ScanConsensus, type LockedReading } from "./consensus";
 import { ScanTelemetry, type FramePhases } from "./telemetry";
@@ -62,6 +63,63 @@ const CONSENSUS_OPTIONS = {
 /** After this many quick looks in a row find nothing, spend one full pyramid
  * scan — the board may be further away than the single-pass range covers. */
 const QUICK_LOOKS_BEFORE_PYRAMID = 6;
+
+/** Reported symptom (2026-08-24, Android Chrome/Edge, deployed build): the
+ * whole page goes unresponsive after backgrounding the tab and coming back.
+ * `nextFrame`'s own timeout only covers one rAF wait, not an `await` that
+ * never settles at all — e.g. `getUserMedia` re-acquiring a camera the OS
+ * hasn't actually released yet, or a WebGPU device request stuck after the
+ * tab's GPU context was reclaimed while hidden. Neither has been reproduced
+ * (no browser on the agent box), so this is a recovery net, not a fix for a
+ * confirmed root cause: if no frame makes progress for this long while the
+ * loop believes it's running, force-cycle the camera rather than sit stalled
+ * forever. Checked well below the interval so one slow deep-pyramid frame
+ * never trips it. */
+const WATCHDOG_STALL_MS = 15000;
+const WATCHDOG_CHECK_MS = 4000;
+/** After this many forced recoveries in one page life, stop retrying and
+ * leave the error panel up — a device that can't hold a camera stream for
+ * more than a few seconds needs a human, not another silent retry loop. */
+const MAX_AUTO_RECOVERIES = 3;
+
+/** Breadcrumb for a freeze/crash with no console to read: written whenever
+ * the camera is live, cleared only on a clean `pagehide`. If a future launch
+ * finds a stale entry, the previous session ended without that handler
+ * firing — evidence for exactly the "whole page unresponsive" report this
+ * file otherwise has none for. */
+const HEARTBEAT_KEY = "boggle.scanner.heartbeat";
+
+function writeHeartbeat(extra: Record<string, unknown> = {}): void {
+  try {
+    localStorage.setItem(
+      HEARTBEAT_KEY,
+      JSON.stringify({ at: Date.now(), ua: navigator.userAgent, ...extra }),
+    );
+  } catch {
+    // Private mode / storage disabled — the breadcrumb is best-effort only.
+  }
+}
+
+function clearHeartbeat(): void {
+  try {
+    localStorage.removeItem(HEARTBEAT_KEY);
+  } catch {
+    /* see writeHeartbeat */
+  }
+}
+
+/** Reads and clears any breadcrumb left by a previous session that never hit
+ * `pagehide` — call once at mount, before the first `writeHeartbeat`. */
+function readStaleHeartbeat(): Record<string, unknown> | null {
+  try {
+    const raw = localStorage.getItem(HEARTBEAT_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(HEARTBEAT_KEY);
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
 
 export interface ScannerHandlers {
   /** The settled letters changed — either the first lock, or a new board was
@@ -212,6 +270,24 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   let loopToken = 0;
   let quickLookMisses = 0;
   let startupMs = 0;
+  /** Watchdog bookkeeping — see WATCHDOG_STALL_MS above. `lastProgressAt`
+   * covers a stuck loop iteration; `startInitiatedAt` covers a `startInner()`
+   * that never gets as far as `running = true` at all (a `getUserMedia` that
+   * never settles, e.g. re-acquiring a camera the OS hasn't released yet). */
+  let lastProgressAt = performance.now();
+  let startInitiatedAt: number | null = null;
+  let autoRecoveries = 0;
+
+  {
+    const stale = readStaleHeartbeat();
+    if (stale) {
+      // "backgrounded" is expected (the OS reclaimed a hidden tab); anything
+      // else means the previous session was actively holding the camera and
+      // never reached pagehide — the closest thing to evidence this file has
+      // for the "whole page unresponsive" report with no console to read.
+      console.warn("scanner: previous session did not exit cleanly", stale);
+    }
+  }
   const consensus = new ScanConsensus(CONSENSUS_OPTIONS);
   const telemetry = new ScanTelemetry();
 
@@ -516,6 +592,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
 
   async function loop(token: number): Promise<void> {
     while (running && token === loopToken) {
+      lastProgressAt = performance.now();
       const iterationStart = performance.now();
       const phases: Partial<FramePhases> = {};
 
@@ -570,8 +647,22 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       drawOverlay();
 
       const classifyStart = performance.now();
-      const classifier = await getClassifier();
-      const predictions = await classifier.classifyCells(result.cells);
+      let predictions: Prediction[];
+      try {
+        const classifier = await getClassifier();
+        predictions = await classifier.classifyCells(result.cells);
+      } catch (error) {
+        // Unlike readFrame's catch, this used to be unguarded: a failure here
+        // (classifier.classifyCells retries once internally and can still
+        // throw, e.g. two backends both unavailable) would escape the loop
+        // entirely — the camera stayed live with nothing reading it, which
+        // looks exactly like a freeze with no error ever shown.
+        console.error("scanner classify failed", error);
+        diagnostics.note = `classify failed: ${String(error).slice(0, 90)}`;
+        renderDiagnostics();
+        await nextFrame();
+        continue;
+      }
       phases.classifyMs = performance.now() - classifyStart;
       diagnostics.classifyMs = phases.classifyMs;
       if (token !== loopToken) return;
@@ -631,6 +722,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   function stop(): void {
     wantsToRun = false;
     running = false;
+    startInitiatedAt = null;
     loopToken++;
     if (pendingStop !== null) {
       clearTimeout(pendingStop);
@@ -650,6 +742,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     }
     if (running) return;
     if (starting) return starting;
+    startInitiatedAt = performance.now();
     starting = startInner().finally(() => {
       starting = null;
     });
@@ -692,6 +785,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       );
       diagnostics.note = `getUserMedia: ${name}`;
       renderDiagnostics();
+      startInitiatedAt = null;
       return;
     }
 
@@ -710,12 +804,52 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     }
 
     running = true;
+    startInitiatedAt = null;
+    autoRecoveries = 0;
+    lastProgressAt = performance.now();
+    writeHeartbeat({ phase: "running" });
     startupMs = performance.now();
     // performance.now() is already measured from page load, so the scanner's
     // start time *is* the startup cost.
     telemetry.begin();
     void loop(++loopToken);
   }
+
+  /** Forces the camera loop back to a known state after the watchdog decides
+   * nothing has progressed in too long — see WATCHDOG_STALL_MS. Abandons any
+   * stuck `starting`/`loop` in place rather than waiting on it (a hung
+   * promise can't be cancelled), tears down whatever camera state exists,
+   * and tries once more, bounded by MAX_AUTO_RECOVERIES so a device that
+   * genuinely can't hold a stream doesn't retry forever in the background. */
+  function recoverFromStall(reason: string): void {
+    console.warn(`scanner watchdog: ${reason}`);
+    autoRecoveries++;
+    writeHeartbeat({ phase: "recovered-from-stall", reason, autoRecoveries });
+    starting = null;
+    startInitiatedAt = null;
+    stop();
+    if (autoRecoveries > MAX_AUTO_RECOVERIES) {
+      showError("The camera keeps stalling on this device. Reload the page.", true);
+      diagnostics.note = `watchdog: gave up after ${autoRecoveries} recoveries`;
+      renderDiagnostics();
+      return;
+    }
+    diagnostics.note = `watchdog: recovered (${reason})`;
+    renderDiagnostics();
+    wantsToRun = true;
+    void start();
+  }
+
+  setInterval(() => {
+    const now = performance.now();
+    if (starting && startInitiatedAt !== null && now - startInitiatedAt > WATCHDOG_STALL_MS) {
+      recoverFromStall("start() never resolved (likely a stuck getUserMedia)");
+    } else if (running && now - lastProgressAt > WATCHDOG_STALL_MS) {
+      recoverFromStall("camera loop stopped making progress");
+    } else if (running) {
+      writeHeartbeat({ phase: "running" });
+    }
+  }, WATCHDOG_CHECK_MS);
 
   // Release the camera when the page is hidden or torn down. Without this the
   // track stayed live past a reload: the browser holds it until the old
@@ -724,7 +858,13 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   //
   // pagehide (not beforeunload/unload) is the one that fires reliably on
   // mobile, including bfcache navigations.
-  window.addEventListener("pagehide", () => stop());
+  window.addEventListener("pagehide", () => {
+    stop();
+    // The one case that counts as a clean exit for the stale-heartbeat check
+    // — every other path that reaches here (backgrounding, a watchdog
+    // recovery) deliberately leaves a breadcrumb behind instead.
+    clearHeartbeat();
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden" && running) {
       // A backgrounded tab cannot paint, so a scan there is pure battery
@@ -734,6 +874,12 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       const shouldResume = wantsToRun;
       stop();
       wantsToRun = shouldResume;
+      // Distinct from the "running"/"recovered-from-stall" phases: an OS
+      // reclaiming a backgrounded tab is expected, not evidence of the freeze
+      // this is meant to catch. Left in place (not cleared) so a resume that
+      // never gets going again still leaves *some* trace of the last known
+      // state, just not an alarming one.
+      writeHeartbeat({ phase: "backgrounded" });
     } else if (document.visibilityState === "visible" && wantsToRun && !running) {
       void start();
     }

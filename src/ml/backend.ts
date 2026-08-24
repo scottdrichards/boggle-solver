@@ -60,12 +60,37 @@ function requestedBackend(): BackendName | null {
   return BACKEND_CHAIN.includes(name as BackendName) ? (name as BackendName) : null;
 }
 
+/** A `requestDevice()`/`setBackend()` call has no timeout of its own, and on
+ * some Android drivers a GPU context request made right after the tab's GPU
+ * process was reclaimed while backgrounded can apparently hang rather than
+ * reject (unconfirmed — no browser on the agent box to reproduce with, see
+ * scanner.ts's watchdog for the same caveat). A stuck backend must not be
+ * allowed to block the whole chain forever; treat a timeout as this
+ * candidate failing so the loop moves on to the next one. */
+const BACKEND_ACTIVATE_TIMEOUT_MS = 8000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function selectFrom(startIndex: number): Promise<BackendName> {
   let lastError: unknown;
   for (let i = startIndex; i < BACKEND_CHAIN.length; i++) {
     const backend = BACKEND_CHAIN[i]!;
     try {
-      await activate(backend);
+      await withTimeout(activate(backend), BACKEND_ACTIVATE_TIMEOUT_MS, `activate(${backend})`);
       return backend;
     } catch (error) {
       lastError = error;
