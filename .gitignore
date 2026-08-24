@@ -2,7 +2,15 @@ node_modules
 dist
 dist-ssr
 public/wordlist.trie.bin
-public/tfjs-wasm
 *.local
 .DS_Store
+training/data
+training/checkpoints
+training/smoke-samples
 *.tsbuildinfo
+.claude/
+public/tfjs-wasm
+e2e/fixtures/*.y4m
+test-results/
+playwright-report/
+blob-report/

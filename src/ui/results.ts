@@ -43,6 +43,7 @@ export function renderResults(
     const item = document.createElement("li");
     const button = document.createElement("button");
     button.className = "result-word";
+    button.dataset.word = word.word;
     button.classList.toggle("active", word.word === highlightedWord);
     button.setAttribute("aria-pressed", String(word.word === highlightedWord));
 
@@ -61,4 +62,18 @@ export function renderResults(
     list.appendChild(item);
   }
   container.appendChild(list);
+}
+
+/** Toggles the active/aria-pressed state on the existing word buttons without
+ * rebuilding the list. Selecting a word used to go through renderResults'
+ * full `container.innerHTML = ""` rebuild, which destroyed the clicked
+ * button mid-click; the browser then moved focus to <body> and scrolled the
+ * page to the top. Updating in place keeps the clicked button (and the
+ * scroll position) intact. */
+export function updateHighlightedWord(container: HTMLElement, highlightedWord: string | null): void {
+  for (const button of container.querySelectorAll<HTMLButtonElement>(".result-word")) {
+    const active = button.dataset.word === highlightedWord;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
 }

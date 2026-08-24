@@ -1,4 +1,5 @@
 import * as tf from "@tensorflow/tfjs";
+import { assessCellQuality } from "../cv/cellQuality";
 import { preprocessCellForModel } from "../cv/preprocess";
 import type { PixelBuffer } from "../cv/quadWarp";
 import { activeBackend, ensureBackend, fallbackBackend, type BackendName } from "./backend";
@@ -7,6 +8,10 @@ export interface Prediction {
   label: string;
   confidence: number;
 }
+
+/** Sentinel label for "no confident letter" — same convention scanner.ts already
+ * maps to an abstaining vote, whether the cause is a low softmax or a rejected crop. */
+const NO_READING: Prediction = { label: "?", confidence: 0 };
 
 const INPUT_SIZE = 32;
 
@@ -78,6 +83,12 @@ export class LetterClassifier {
   }
 
   private async loadModelOnCurrentBackend(): Promise<void> {
+    // Release the previous weights first. This method is called again on a
+    // mid-session backend fallback, and without this the old model's
+    // variables stayed live — on WebGL/WebGPU that is retained GPU memory on
+    // a device that just proved it was under pressure.
+    this.model?.dispose();
+    this.model = null;
     this.model = await tf.loadLayersModel(this.modelUrl);
     // Warm-up inference hides WebGPU/WebGL's first-use shader-compile
     // latency so the user's first real classification isn't the slow one.
@@ -107,9 +118,15 @@ export class LetterClassifier {
     const probsByRow = (await predictions.array()) as number[][];
     predictions.dispose();
 
-    return probsByRow.map((row) => {
+    return probsByRow.map((row, i) => {
+      // A glare-blown or washed-out crop is rejected before we even ask the
+      // model — the softmax on a corrupted glyph is frequently confident, so
+      // confidence alone can't be trusted to catch this (that's the whole
+      // reason the frame-level confidence gate in consensus.ts isn't enough).
+      if (assessCellQuality(cells[i]!).rejected) return NO_READING;
+
       let bestIndex = 0;
-      for (let i = 1; i < row.length; i++) if (row[i]! > row[bestIndex]!) bestIndex = i;
+      for (let j = 1; j < row.length; j++) if (row[j]! > row[bestIndex]!) bestIndex = j;
       return { label: this.labels[bestIndex] ?? "?", confidence: row[bestIndex]! };
     });
   }

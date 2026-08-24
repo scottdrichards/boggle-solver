@@ -12,6 +12,9 @@
     "pretest": "npm run build:wordlist",
     "test": "vitest run",
     "test:watch": "vitest",
+    "pretest:e2e": "npm run predev",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
     "build:wordlist": "tsx scripts/buildWordlist.ts",
     "copy:wasm": "tsx scripts/copyWasm.ts"
@@ -22,8 +25,8 @@
     "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^26.1.2",
-    "an-array-of-english-words": "^2.0.0",
     "tsx": "^4.23.8",
     "typescript": "^7.0.2",
     "vite": "^8.2.0",

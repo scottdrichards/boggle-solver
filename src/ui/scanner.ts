@@ -30,7 +30,7 @@
 import { CONFIDENT_INLIERS } from "../cv/gridDetector";
 import { sliceIntoCells, warpQuadToSquare, type PixelBuffer, type Point } from "../cv/quadWarp";
 import { getClassifier, getDetector, prefetchModels } from "../ml/models";
-import { activeBackend } from "../ml/backend";
+import { activeBackend, tensorMemory } from "../ml/backend";
 import { ScanConsensus, type LockedReading } from "./consensus";
 import { ScanTelemetry, type FramePhases } from "./telemetry";
 import { mountBoardView, LOCK_TRANSITION_MS } from "./boardView";
@@ -39,6 +39,12 @@ import { setTiles, state } from "./state";
 /** Frames are captured at this working size, matching the photo path so a
  * crop cut from a frame is the same kind of image the model was tuned on. */
 const WORKING_MAX_DIMENSION = 1400;
+/** Same endpoint `serveTLS.py`/`submitServer.py` already implement — see
+ * "Report wrong board" below. Relative + BASE_URL-prefixed so it resolves
+ * correctly whether served from `/` or GitHub Pages' subpath; on GitHub
+ * Pages there is no server behind it and the POST just fails, which the
+ * report handler treats the same as any other network error. */
+const SUBMIT_ENDPOINT = `${import.meta.env.BASE_URL}api/submit`;
 /** Detection-only grab size. The detector resamples every crop to 128x128
  * regardless, so detail here is wasted — and this readback happens on every
  * frame, including the ones that find nothing. */
@@ -93,6 +99,8 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     <p class="scanner-error" id="scanner-error" hidden></p>
     <div class="scanner-actions">
       <button type="button" id="scanner-retry" hidden>Retry camera</button>
+      <button type="button" id="scanner-review" hidden>Review letters</button>
+      <button type="button" id="scanner-report" hidden>Report wrong board</button>
       <button type="button" id="scanner-rescan" hidden>Scan a new board</button>
     </div>
     <pre class="scanner-diagnostics" id="scanner-diagnostics" hidden></pre>
@@ -104,6 +112,8 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   const statusEl = container.querySelector<HTMLElement>("#scanner-status")!;
   const errorEl = container.querySelector<HTMLElement>("#scanner-error")!;
   const retryBtn = container.querySelector<HTMLButtonElement>("#scanner-retry")!;
+  const reviewBtn = container.querySelector<HTMLButtonElement>("#scanner-review")!;
+  const reportBtn = container.querySelector<HTMLButtonElement>("#scanner-report")!;
   const rescanBtn = container.querySelector<HTMLButtonElement>("#scanner-rescan")!;
   const diagnosticsEl = container.querySelector<HTMLElement>("#scanner-diagnostics")!;
   const overlayCtx = overlay.getContext("2d")!;
@@ -197,11 +207,28 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
    * resolves, so two rapid starts both sailed past the guard and the first
    * stream was leaked — the camera stayed live with nothing reading it. */
   let starting: Promise<void> | null = null;
+  /** Deferred camera release scheduled by `lockIn` — see there. */
+  let pendingStop: number | null = null;
   let loopToken = 0;
   let quickLookMisses = 0;
   let startupMs = 0;
   const consensus = new ScanConsensus(CONSENSUS_OPTIONS);
   const telemetry = new ScanTelemetry();
+
+  /** Snapshot of the current lock, kept only so "Report wrong board" has
+   * something to send — there is no manual-correction UI any more (see the
+   * project brief), so this reports the board as-read rather than
+   * as-corrected. A human sorts flagged-vs-fine submissions out later from
+   * `meta.json`'s `reportedWrong` field, same pipeline the removed capture.ts
+   * fed via `/api/submit`. */
+  let pendingReport: {
+    photo: HTMLCanvasElement;
+    letters: string[];
+    confidences: (number | null)[];
+    quad: [Point, Point, Point, Point];
+    frameWidth: number;
+    frameHeight: number;
+  } | null = null;
 
   /** On-screen diagnostics, opt-in via `?debug=1`. There is no console on a
    * phone, and these were how the aspect-distortion bug got found — but the
@@ -221,6 +248,9 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     frames: 0,
     unsettled: 0,
     meanConfidence: 0,
+    tensors: 0,
+    tensorMB: 0,
+    heapMB: 0,
     note: "",
   };
 
@@ -235,6 +265,9 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       `votes    ${diagnostics.frames} frames, ${diagnostics.unsettled} cells unsettled, conf ${diagnostics.meanConfidence.toFixed(
         2,
       )}`,
+      `memory   ${diagnostics.tensors} tensors, ${diagnostics.tensorMB.toFixed(1)}MB tfjs${
+        diagnostics.heapMB > 0 ? `, ${diagnostics.heapMB.toFixed(0)}MB heap` : ""
+      }`,
       diagnostics.note,
     ]
       .filter(Boolean)
@@ -250,6 +283,13 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     iterationStart: number,
     progress: { unsettled: number; meanConfidence: number },
   ): void {
+    const tensors = tensorMemory();
+    // Non-standard and Chromium-only; absent everywhere else, hence the cast
+    // rather than a global type declaration for something that may not exist.
+    const heapBytes = (performance as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0;
+    diagnostics.tensors = tensors.numTensors;
+    diagnostics.tensorMB = tensors.numBytes / 1e6;
+    diagnostics.heapMB = heapBytes / 1e6;
     telemetry.record({
       captureMs: phases.captureMs ?? 0,
       detectMs: phases.detectMs ?? 0,
@@ -266,6 +306,9 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       passes: phases.passes ?? 0,
       unsettled: progress.unsettled,
       meanConfidence: progress.meanConfidence,
+      tensors: tensors.numTensors,
+      tensorMB: tensors.numBytes / 1e6,
+      heapMB: heapBytes / 1e6,
     });
   }
 
@@ -335,8 +378,27 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     if (width === 0 || height === 0) return null;
 
     const scale = Math.min(1, maxDimension / Math.max(width, height));
-    canvas.width = Math.round(width * scale);
-    canvas.height = Math.round(height * scale);
+    const targetWidth = Math.round(width * scale);
+    const targetHeight = Math.round(height * scale);
+    // Only assign when the size actually changes. Assigning `canvas.width` is
+    // not a no-op when the value is unchanged: it resets the drawing surface
+    // and reallocates the backing store, which is native (often GPU) memory
+    // the JS heap does not account for and the browser reclaims lazily. This
+    // ran on *every* frame — ~0.9 MB for the detect grab plus ~4.4 MB for the
+    // full-resolution one — so a camera left running churned tens of MB per
+    // second of allocations nothing in the JS profile would show. Which is
+    // exactly the shape of "left it up for a while and the tab died".
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      // Resizing resets context state, so the smoothing hints set at creation
+      // have to be reapplied. They were silently being reset every frame
+      // before, which is its own small bug.
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+    }
+    // The video frame is opaque and covers the canvas exactly, so the stale
+    // previous frame underneath is fully overwritten — no clear needed.
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     return { buffer: ctx.getImageData(0, 0, canvas.width, canvas.height), canvas };
   }
@@ -394,9 +456,32 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
    * camera hardware once the animation has had time to fully cover it —
    * releasing sooner would blank the video mid-transition, since clearing
    * `srcObject` drops the last frame instantly in most browsers. */
-  function lockIn(locked: LockedReading, quadInFrame: [Point, Point, Point, Point], frame: FrameCapture, warped: PixelBuffer): void {
+  function lockIn(
+    locked: LockedReading,
+    quadInFrame: [Point, Point, Point, Point],
+    frame: FrameCapture,
+    warped: PixelBuffer,
+    cells: readonly PixelBuffer[],
+    fullFrame: FrameCapture,
+    fullQuad: [Point, Point, Point, Point],
+  ): void {
     setTiles(locked.letters);
     sendTelemetry("locked", locked.letters);
+
+    // Full working-resolution photo + the quad scaled to match it — same
+    // pair `readFrame` used to warp/slice, so what gets submitted is exactly
+    // what the classifier saw, not the smaller detect-only grab `frame` is.
+    pendingReport = {
+      photo: fullFrame.canvas,
+      letters: [...locked.letters],
+      confidences: [...locked.confidences],
+      quad: fullQuad,
+      frameWidth: fullFrame.buffer.width,
+      frameHeight: fullFrame.buffer.height,
+    };
+    reportBtn.hidden = false;
+    reportBtn.disabled = false;
+    reportBtn.textContent = "Report wrong board";
 
     wantsToRun = false;
     running = false;
@@ -409,11 +494,22 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       frameHeight: frame.buffer.height,
       board: warped,
       gridSize: state.gridSize,
+      cells,
+      letters: locked.letters,
+      confidences: locked.confidences,
     });
+    reviewBtn.hidden = false;
+    reviewBtn.textContent = "Review letters";
     rescanBtn.hidden = false;
     setStatus("Board captured — tap a word to trace it, or scan a new board.");
 
-    setTimeout(stop, LOCK_TRANSITION_MS + 100);
+    // Cancelled by `start()`: tapping "Scan a new board" during the flatten
+    // animation would otherwise have this fire a moment later and stop the
+    // camera that had just been reopened.
+    pendingStop = window.setTimeout(() => {
+      pendingStop = null;
+      stop();
+    }, LOCK_TRANSITION_MS + 100);
 
     handlers.onLocked();
   }
@@ -494,7 +590,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       recordFrame(phases, deep, iterationStart, progress);
 
       if (locked) {
-        lockIn(locked, result.fit.quad, frame, result.warped);
+        lockIn(locked, result.fit.quad, frame, result.warped, result.cells, result.full, result.quad);
         return; // camera is stopped inside lockIn; nothing left for this loop to do
       } else {
         setStatus(
@@ -516,13 +612,19 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     // timeout is the escape hatch; the loop's own visibility check stops it.
     return new Promise((resolve) => {
       let settled = false;
+      // Cancel the loser. Leaving both pending left a stray timer (and a
+      // retained closure) behind on every single frame of the scan; the loop
+      // runs for as long as the camera is up, so "small per frame" is the
+      // only kind of leak this file can have.
       const done = () => {
         if (settled) return;
         settled = true;
+        cancelAnimationFrame(rafHandle);
+        clearTimeout(timerHandle);
         resolve();
       };
-      requestAnimationFrame(done);
-      setTimeout(done, 250);
+      const rafHandle = requestAnimationFrame(done);
+      const timerHandle = setTimeout(done, 250);
     });
   }
 
@@ -530,6 +632,10 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     wantsToRun = false;
     running = false;
     loopToken++;
+    if (pendingStop !== null) {
+      clearTimeout(pendingStop);
+      pendingStop = null;
+    }
     for (const track of stream?.getTracks() ?? []) track.stop();
     stream = null;
     video.srcObject = null;
@@ -538,6 +644,10 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
 
   async function start(): Promise<void> {
     wantsToRun = true;
+    if (pendingStop !== null) {
+      clearTimeout(pendingStop);
+      pendingStop = null;
+    }
     if (running) return;
     if (starting) return starting;
     starting = startInner().finally(() => {
@@ -634,8 +744,63 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     void start();
   });
 
+  reviewBtn.addEventListener("click", () => {
+    boardView.toggleReview();
+    reviewBtn.textContent = boardView.reviewing ? "Show board" : "Review letters";
+  });
+
+  /** Sends the current lock to `/api/submit` as a flagged-wrong training
+   * sample: the full-res photo plus the board *as read*, since there is no
+   * manual-correction UI to supply a fix (see the project brief on the UI
+   * strip-down). `photo.toBlob` reads the canvas's pixels synchronously at
+   * this call, before any `await`, so a "Scan a new board" tap racing the
+   * upload can't corrupt it — `frameCanvas` gets reused by the next lock. */
+  reportBtn.addEventListener("click", () => {
+    const report = pendingReport;
+    if (!report) return;
+    reportBtn.disabled = true;
+    reportBtn.textContent = "Reporting…";
+    report.photo.toBlob(
+      (blob) => {
+        if (!blob) {
+          reportBtn.disabled = false;
+          reportBtn.textContent = "Couldn't report — tap to retry";
+          return;
+        }
+        const meta = {
+          letters: report.letters,
+          predictions: report.letters,
+          confidences: report.confidences,
+          quad: report.quad,
+          frameWidth: report.frameWidth,
+          frameHeight: report.frameHeight,
+          gridSize: state.gridSize,
+          reportedWrong: true,
+        };
+        const form = new FormData();
+        form.append("photo", blob, "photo.jpg");
+        form.append("meta", JSON.stringify(meta));
+        fetch(SUBMIT_ENDPOINT, { method: "POST", body: form })
+          .then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            reportBtn.textContent = "Reported — thanks";
+          })
+          .catch((error) => {
+            console.warn("submit report failed", error);
+            reportBtn.disabled = false;
+            reportBtn.textContent = "Couldn't reach server — tap to retry";
+          });
+      },
+      "image/jpeg",
+      0.92,
+    );
+  });
+
   rescanBtn.addEventListener("click", () => {
     rescanBtn.hidden = true;
+    reviewBtn.hidden = true;
+    reportBtn.hidden = true;
+    pendingReport = null;
     boardView.reset();
     video.style.opacity = "1";
     void start();

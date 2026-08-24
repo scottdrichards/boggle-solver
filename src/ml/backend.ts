@@ -110,6 +110,19 @@ export function activeBackend(): BackendName | null {
   return BACKEND_CHAIN.includes(name as BackendName) ? (name as BackendName) : null;
 }
 
+/** Live tensor count and bytes held by the backend.
+ *
+ * Exposed because a tensor leak in a loop that runs for as long as the camera
+ * is up is invisible from anywhere else: tfjs holds GPU textures/buffers that
+ * neither the JS heap profile nor `performance.memory` accounts for, and a
+ * phone has no console to check `tf.memory()` from. A count that climbs frame
+ * over frame is a missing `dispose`/`tidy`; one that sits flat rules the whole
+ * class of cause out in a single glance. */
+export function tensorMemory(): { numTensors: number; numBytes: number } {
+  const memory = tf.memory();
+  return { numTensors: memory.numTensors, numBytes: memory.numBytes };
+}
+
 /** Test/benchmark hook: forget the memoized choice so the next
  * `ensureBackend()` re-selects. Not used by the app itself. */
 export function resetBackendSelection(): void {

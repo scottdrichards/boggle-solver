@@ -67,6 +67,14 @@ export interface BoardLockParams {
   /** The already-warped square board image (see `warpQuadToSquare`). */
   readonly board: PixelBuffer;
   readonly gridSize: number;
+  /** Per-cell crops the classifier actually saw (see `sliceIntoCells`),
+   * row-major — feeds the letter-review grid so a misread die can be spotted
+   * by eye against the exact image that produced it, not a re-crop of the
+   * board that might not match. */
+  readonly cells: readonly PixelBuffer[];
+  /** The locked reading for each cell, same order as `cells`. */
+  readonly letters: readonly string[];
+  readonly confidences: readonly (number | null)[];
 }
 
 export interface BoardView {
@@ -89,7 +97,13 @@ export interface BoardView {
    * cutting to blank between them — see the implementation note above
    * `playFlourish`. No-op before a lock. */
   playFlourish(paths: readonly (readonly number[])[], totalMs: number): void;
+  /** Shows or hides the per-cell letter-review grid in place of the board
+   * image — a quick "did it read this right?" check against the exact crops
+   * the classifier saw. Toggles the current state when `on` is omitted.
+   * No-op before a lock. */
+  toggleReview(on?: boolean): void;
   readonly locked: boolean;
+  readonly reviewing: boolean;
 }
 
 /** Curve data for one word's path: a dense polyline plus its cumulative arc
@@ -145,6 +159,14 @@ function quadToMatrix3d(quad: readonly [Point, Point, Point, Point], boxWidth: n
 }
 
 export function mountBoardView(container: HTMLElement, video: HTMLVideoElement): BoardView {
+  // The board is always square (see boggle/board.ts), but the stage is a
+  // fixed 3:4 portrait rect matching the camera framing (scanner.ts). Rather
+  // than stretch the square board image to fill that rect, this wrapper is
+  // CSS-centered as a square within the stage, and the three board layers
+  // fill *it* — see `.scanner-board-square` in style.css.
+  const boardSquare = document.createElement("div");
+  boardSquare.className = "scanner-board-square";
+
   const boardCanvas = document.createElement("canvas");
   boardCanvas.className = "scanner-board";
   boardCanvas.hidden = true;
@@ -157,13 +179,24 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
   const trailCanvas = document.createElement("canvas");
   trailCanvas.className = "scanner-trail";
   trailCanvas.hidden = true;
-  container.append(boardCanvas, heatmapCanvas, trailCanvas);
+  // The letter-review grid: one crop + label per cell, laid out over the
+  // board square in place of the flattened image. A separate element rather
+  // than a canvas overlay because each cell needs its own <img>-like bitmap
+  // plus a text label — simpler as DOM than hand-drawing 25 crops + labels
+  // into one canvas every toggle.
+  const reviewGrid = document.createElement("div");
+  reviewGrid.className = "scanner-review";
+  reviewGrid.hidden = true;
+  boardSquare.append(boardCanvas, heatmapCanvas, trailCanvas, reviewGrid);
+  container.append(boardSquare);
 
   const boardCtx = boardCanvas.getContext("2d")!;
   const heatmapCtx = heatmapCanvas.getContext("2d")!;
   const trailCtx = trailCanvas.getContext("2d")!;
 
   let locked = false;
+  let reviewing = false;
+  let heatmapVisible = false;
   let gridSize = 5;
   let animationFrame: number | null = null;
 
@@ -265,10 +298,12 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
   function showHeatmap(weights: ArrayLike<number> | null): void {
     if (!weights || weights.length === 0 || !locked) {
       clearHeatmap();
+      heatmapVisible = false;
       heatmapCanvas.hidden = true;
       return;
     }
-    heatmapCanvas.hidden = false;
+    heatmapVisible = true;
+    heatmapCanvas.hidden = reviewing;
     drawHeatmap(weights);
   }
 
@@ -614,13 +649,88 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     animationFrame = requestAnimationFrame(frame);
   }
 
+  /** Confidence tier used to color a review cell's border — a systematically
+   * misread die is exactly the case where "the model looked sure" is the
+   * useful signal, so the banding is coarse and glanceable rather than a
+   * continuous gradient. Matches the thresholds already used elsewhere for
+   * "confident" (0.85) and the scanner's own lock floor (0.55). */
+  function confidenceTier(confidence: number | null): "low" | "mid" | "high" {
+    if (confidence === null) return "low";
+    if (confidence >= 0.85) return "high";
+    if (confidence >= 0.55) return "mid";
+    return "low";
+  }
+
+  /** (Re)builds the letter-review grid from a lock's cells/letters/
+   * confidences. Rebuilds the DOM each time rather than diffing — this only
+   * runs once per lock, not per frame. */
+  function buildReviewGrid(
+    cells: readonly PixelBuffer[],
+    letters: readonly string[],
+    confidences: readonly (number | null)[],
+    size: number,
+  ): void {
+    reviewGrid.innerHTML = "";
+    reviewGrid.style.gridTemplateColumns = `repeat(${size}, 1fr)`;
+    for (let i = 0; i < cells.length; i++) {
+      const cell = cells[i]!;
+      const letter = letters[i] ?? "";
+      const confidence = confidences[i] ?? null;
+
+      const cellEl = document.createElement("div");
+      cellEl.className = `scanner-review-cell scanner-review-cell--${confidenceTier(confidence)}`;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = cell.width;
+      canvas.height = cell.height;
+      canvas.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(cell.data), cell.width, cell.height), 0, 0);
+      cellEl.append(canvas);
+
+      const label = document.createElement("span");
+      label.className = "scanner-review-letter";
+      label.textContent = letter === "" ? "?" : letter.toUpperCase();
+      cellEl.append(label);
+
+      if (confidence !== null) {
+        const confidenceLabel = document.createElement("span");
+        confidenceLabel.className = "scanner-review-confidence";
+        confidenceLabel.textContent = Math.round(confidence * 100).toString();
+        cellEl.append(confidenceLabel);
+      }
+
+      reviewGrid.append(cellEl);
+    }
+  }
+
+  function toggleReview(on?: boolean): void {
+    if (!locked) return;
+    reviewing = on ?? !reviewing;
+    reviewGrid.hidden = !reviewing;
+    boardCanvas.hidden = reviewing;
+    heatmapCanvas.hidden = reviewing || !heatmapVisible;
+    trailCanvas.hidden = reviewing;
+  }
+
   function lock(params: BoardLockParams): void {
     stopAnimation();
     gridSize = params.gridSize;
-    const box = video.getBoundingClientRect();
-    const containerQuad = params.quad.map((point) =>
-      toContainerPoint(point, params.frameWidth, params.frameHeight, box),
-    ) as [Point, Point, Point, Point];
+    reviewing = false;
+    reviewGrid.hidden = true;
+    buildReviewGrid(params.cells, params.letters, params.confidences, params.gridSize);
+    // The quad's on-screen position has to be computed against the video's
+    // own displayed rect (it matches `object-fit: cover`, same as the live
+    // overlay dots in scanner.ts) — but the corner-pin transform itself is
+    // local to boardSquare's box, which is a centered square smaller than
+    // the video's rect, not congruent with it. Re-express the quad relative
+    // to boardSquare's own top-left before building the matrix.
+    const videoBox = video.getBoundingClientRect();
+    const squareBox = boardSquare.getBoundingClientRect();
+    const offsetX = squareBox.left - videoBox.left;
+    const offsetY = squareBox.top - videoBox.top;
+    const containerQuad = params.quad.map((point) => {
+      const p = toContainerPoint(point, params.frameWidth, params.frameHeight, videoBox);
+      return { x: p.x - offsetX, y: p.y - offsetY };
+    }) as [Point, Point, Point, Point];
 
     boardCanvas.width = params.board.width;
     boardCanvas.height = params.board.height;
@@ -641,7 +751,7 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     // shows the same board, merely already de-skewed.
     boardCanvas.style.transition = "none";
     boardCanvas.style.opacity = "1";
-    boardCanvas.style.transform = quadToMatrix3d(containerQuad, box.width, box.height);
+    boardCanvas.style.transform = quadToMatrix3d(containerQuad, squareBox.width, squareBox.height);
     video.style.transition = "none";
     video.style.opacity = "1";
     // Force a style flush so the next assignment is seen as a change to
@@ -661,9 +771,12 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
   function reset(): void {
     stopAnimation();
     locked = false;
+    reviewing = false;
     boardCanvas.hidden = true;
     trailCanvas.hidden = true;
     heatmapCanvas.hidden = true;
+    reviewGrid.hidden = true;
+    reviewGrid.innerHTML = "";
     clearTrail();
     clearHeatmap();
     boardCanvas.style.transition = "none";
@@ -678,8 +791,12 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     showPath,
     showHeatmap,
     playFlourish,
+    toggleReview,
     get locked() {
       return locked;
+    },
+    get reviewing() {
+      return reviewing;
     },
   };
 }

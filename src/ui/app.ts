@@ -1,7 +1,7 @@
 import { SolverClient } from "../workers/solverClient";
 import { computeCellHeatmap } from "../boggle/heatmap";
 import type { ScoredWord } from "../boggle/score";
-import { renderResults } from "./results";
+import { renderResults, updateHighlightedWord } from "./results";
 import { mountScanner } from "./scanner";
 import { setHighlightedWord, setResults, state } from "./state";
 
@@ -55,7 +55,7 @@ export async function mountApp(root: HTMLElement): Promise<void> {
         setHighlightedWord(word);
         const scored = word ? state.results.find((result) => result.word === word) : undefined;
         scanner.showPath(scored ? scored.path : null);
-        refreshResults();
+        updateHighlightedWord(resultsEl, word);
       },
       onToggleHeatmap() {
         heatmapOn = !heatmapOn;

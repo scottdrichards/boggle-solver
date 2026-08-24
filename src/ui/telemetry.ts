@@ -37,6 +37,15 @@ export interface FramePhases {
   /** Cells still unsettled after this frame's vote. */
   unsettled: number;
   meanConfidence: number;
+  /** Live tfjs tensors after this frame. Flat = no tensor leak; a steady
+   * climb over a scan is a missing dispose/tidy. */
+  tensors: number;
+  /** tfjs-held bytes (GPU textures/buffers included), MB. */
+  tensorMB: number;
+  /** `performance.memory.usedJSHeapSize` in MB where the browser exposes it
+   * (Chromium only), else 0. Deliberately separate from `tensorMB`: a scan
+   * can die from either, and they have completely different fixes. */
+  heapMB: number;
 }
 
 export interface ScanReport {
@@ -51,8 +60,27 @@ export interface ScanReport {
   totalMs: number;
   outcome: "locked" | "timeout" | "cancelled";
   frames: FramePhases[];
+  /** Frames dropped from the head of `frames` because the scan outran
+   * `MAX_FRAMES`. Non-zero means `frames` is the tail of a longer scan. */
+  droppedFrames: number;
   letters?: string[];
 }
+
+/**
+ * Hard cap on retained frames.
+ *
+ * This buffer used to be unbounded, which made it the one structure in the app
+ * whose size grew with how long the camera was held up: a scan that never locks
+ * records a frame every iteration forever. At a few frames a second that is
+ * tens of thousands of objects — and then a multi-megabyte `JSON.stringify` at
+ * the end, well past `sendBeacon`'s size limit, on a phone that is already
+ * short of memory.
+ *
+ * The tail is what gets kept: a long scan's interesting part is the end (the
+ * lock, or what it was doing when it gave up), and the head of a search that
+ * ran for ten minutes is a thousand near-identical misses.
+ */
+const MAX_FRAMES = 600;
 
 const ENDPOINT = `${import.meta.env.BASE_URL}api/telemetry`;
 
@@ -63,27 +91,44 @@ function newSessionId(): string {
 export class ScanTelemetry {
   readonly sessionId = newSessionId();
   private frames: FramePhases[] = [];
+  private droppedFrames = 0;
   private startedAt = 0;
 
   begin(): void {
     this.frames = [];
+    this.droppedFrames = 0;
     this.startedAt = performance.now();
   }
 
   record(frame: FramePhases): void {
     this.frames.push(frame);
+    if (this.frames.length > MAX_FRAMES) {
+      // Drop in one chunk rather than shifting every frame: a repeated
+      // `shift()` on a 600-element array is per-frame work in the scan loop,
+      // and this runs at most once per 10% of the cap.
+      const excess = this.frames.length - MAX_FRAMES;
+      this.frames.splice(0, excess + MAX_FRAMES / 10);
+      this.droppedFrames += excess + MAX_FRAMES / 10;
+    }
   }
 
   /** Sends and clears. Never throws and never blocks the caller. */
-  send(report: Omit<ScanReport, "sessionId" | "frames" | "totalMs">, letters?: string[]): void {
+  send(report: Omit<ScanReport, "sessionId" | "frames" | "droppedFrames" | "totalMs">, letters?: string[]): void {
     const payload: ScanReport = {
       ...report,
       sessionId: this.sessionId,
       totalMs: performance.now() - this.startedAt,
       frames: this.frames,
+      droppedFrames: this.droppedFrames,
       letters,
     };
     const body = JSON.stringify(payload);
+    // Actually clear, as the name promises. `begin()` used to be the only
+    // thing that emptied the buffer, so a send with no restart after it (a
+    // lock that is never followed by "scan a new board") left every frame of
+    // that scan retained for the rest of the page's life.
+    this.frames = [];
+    this.droppedFrames = 0;
 
     // sendBeacon survives the page being backgrounded mid-scan, which fetch
     // does not reliably do; fall back where it is unavailable or refuses.

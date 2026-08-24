@@ -1,6 +1,14 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import words from "an-array-of-english-words";
+
+// NASPA Word List 2023 (NWL2023) headword list (one word per line, no
+// definitions) — the current North American tournament Scrabble word list,
+// successor to the Official Scrabble Players Dictionary (OSPD). Every valid
+// word, inflected forms included as their own entries. Extracted from
+// scrabblewords/scrabblewords' words/North-American/NWL2023.txt by taking
+// just the leading token off each entry.
+const WORDLIST_PATH = resolve("scripts/wordlists/nwl2023.txt");
+const words = readFileSync(WORDLIST_PATH, "utf8").split("\n").filter(Boolean);
 
 // Binary DAWG format ("BGL1"), read by src/boggle/trie.ts:
 //   uint32 magic, uint32 rootId, uint32 nodeCount, uint32 edgeCount
