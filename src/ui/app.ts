@@ -3,7 +3,7 @@ import { computeCellHeatmap } from "../boggle/heatmap";
 import type { ScoredWord } from "../boggle/score";
 import { renderResults, updateHighlightedWord } from "./results";
 import { mountScanner } from "./scanner";
-import { setHighlightedWord, setResults, state } from "./state";
+import { minWordLengthFor, setHighlightedWord, setResults, state } from "./state";
 
 /** How many words flash during the post-lock "thinking" flourish, and the
  * total wall-clock time it's allotted (see playThinkingFlourish). */
@@ -94,7 +94,7 @@ export async function mountApp(root: HTMLElement): Promise<void> {
 
   async function runSolve(): Promise<void> {
     if (!dictionaryReady || state.tiles.some((tile) => tile === "")) return;
-    const outcome = await solver.solve(state.tiles);
+    const outcome = await solver.solve(state.tiles, minWordLengthFor(state.gridSize));
     setResults(outcome.words, outcome.totalPoints);
     refreshResults();
     applyHeatmap();
@@ -115,4 +115,8 @@ export async function mountApp(root: HTMLElement): Promise<void> {
   // The app's whole interaction: open it and point it at a board. The camera
   // starts on its own — no tap required — so this is the entire golden path.
   void scanner.start();
+
+  // scanner.ts owns its own pipeline worker's pagehide teardown (a longer
+  // story — see PIPELINE_IDLE_MS there); the solver worker just needs this.
+  window.addEventListener("pagehide", () => solver.terminate());
 }

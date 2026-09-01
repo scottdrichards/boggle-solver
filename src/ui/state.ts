@@ -1,10 +1,17 @@
 import type { ScoredWord } from "../boggle/score";
 
-/** 5x5 (Big Boggle) only for now — the 4x4 path is disabled app-wide while we
- * concentrate the model on the one board that actually gets played here. The
- * lattice fitter is also pinned to 5 so it can never fit a 4x4 sub-lattice on
- * a 5x5 board, which would mis-slice every cell. */
-export type GridSize = 5;
+/** 4x4 (classic Boggle) or 5x5 (Big Boggle) — the scanner auto-detects which
+ * one it's looking at (`src/cv/latticeFit.ts` tries both, tie-broken toward
+ * the smaller board, and only reads 5 when the extra ring of peaks is
+ * actually there). `state.gridSize` tracks whatever the current scan last
+ * detected; it's a starting guess until a board actually locks. */
+export type GridSize = 4 | 5;
+
+/** Classic 4x4 sets use a 3-letter minimum; Big Boggle (5x5) uses 4 — this
+ * app's existing house rule. */
+export function minWordLengthFor(gridSize: GridSize): number {
+  return gridSize === 4 ? 3 : 4;
+}
 
 export interface AppState {
   gridSize: GridSize;
@@ -27,6 +34,10 @@ export const state: AppState = {
   totalPoints: 0,
   highlightedWord: null,
 };
+
+export function setGridSize(gridSize: GridSize): void {
+  state.gridSize = gridSize;
+}
 
 export function setTiles(values: readonly string[]): void {
   state.tiles = [...values];

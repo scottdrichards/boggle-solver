@@ -10,17 +10,18 @@ export interface FoundWord {
   path: readonly number[];
 }
 
-/** This app's house rule is 4+ letters (no 3-letter words), stricter than
- * the trie's own 3-letter floor (see scripts/buildWordlist.ts) — enforced
- * here rather than by rebuilding the compiled dictionary. */
-const MIN_WORD_LENGTH = 4;
+/** House rule is 4+ letters on Big Boggle (5x5), matching the trie's own
+ * 3-letter floor only on classic 4x4 boards (see `minWordLengthFor` in
+ * `src/ui/state.ts` and scripts/buildWordlist.ts for the dictionary's own
+ * floor) — enforced here rather than by rebuilding the compiled dictionary. */
+const DEFAULT_MIN_WORD_LENGTH = 4;
 
 /**
  * DFS over the board's 8-directionally-adjacent cells (each cell used at
  * most once per word), pruned by trie-prefix existence. A word is reported
  * once even if multiple paths spell it.
  */
-export function solve(board: Board, trie: Trie): FoundWord[] {
+export function solve(board: Board, trie: Trie, minWordLength: number = DEFAULT_MIN_WORD_LENGTH): FoundWord[] {
   const { size, tiles } = board;
   const neighbors = computeNeighbors(size);
   const visited = new Uint8Array(tiles.length);
@@ -42,7 +43,7 @@ export function solve(board: Board, trie: Trie): FoundWord[] {
     }
 
     if (node !== -1) {
-      if (trie.isWord(node) && wordChars.length >= MIN_WORD_LENGTH) {
+      if (trie.isWord(node) && wordChars.length >= minWordLength) {
         const word = wordChars.join("");
         if (!found.has(word)) {
           found.set(word, { word, path: [...path] });

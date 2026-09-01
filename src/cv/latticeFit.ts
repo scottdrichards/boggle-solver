@@ -358,15 +358,42 @@ export function fitLattice(peaks: readonly Point[], options: LatticeFitOptions =
   const spacing = medianSpacing(peaks);
   if (!(spacing > 0)) return null;
 
-  /** Window count for the best grid size, ties broken toward the smaller board:
-   * every 4x4 sub-window of a full 5x5 also holds 16 inliers, so only a size
-   * that strictly explains MORE peaks earns the larger reading. */
+  /** Window count for the best grid size, ties broken toward the smaller
+   * board: every 4x4 sub-window of a full 5x5 also holds 16 inliers, so a
+   * larger size only earns the reading if it explains strictly MORE peaks
+   * *without* explaining a meaningfully smaller share of its own board.
+   *
+   * The second half of that rule was added 2026-08-24 after real 4x4 photos
+   * (background clutter, not a synthetic render) measured the raw-count-only
+   * version choosing 5x5 every time: a real 4x4 board plus a few unrelated
+   * peaks from clutter (table edge, box, wood grain) explains MORE peaks
+   * under a 5x5 hypothesis just because 25 sites offer more chances for
+   * clutter to land within tolerance of *some* site — not because there's
+   * really a 5th ring of dice. Measured on 3 real photos of one physical 4x4
+   * board: the true 4x4 window always hit fill 1.00 (16/16, tight residual),
+   * while the spurious 5x5 reading the old rule picked scored only 0.64-0.80
+   * fill. A genuine 5x5 board's whole-board fill, by contrast, was never
+   * more than ~0.04 below its own embedded-4x4-subwindow's fill (0.96 vs
+   * 1.00 on a reviewed demo photo) — real additional rows are dense and
+   * consistent, unlike scattered clutter. `LARGER_SIZE_FILL_SLACK` sits well
+   * inside that gap: generous enough for a real larger board's few missed
+   * dice, tight enough that a clutter-inflated larger reading can't clear
+   * it. */
+  const LARGER_SIZE_FILL_SLACK = 0.12;
   const score = (assignments: readonly Assignment[]) => {
     let best: { size: number; window: NonNullable<ReturnType<typeof bestWindow>> } | null = null;
     for (const size of [...gridSizes].sort((a, b) => a - b)) {
       const window = bestWindow(assignments, size);
       if (!window) continue;
-      if (!best || window.inliers.length > best.window.inliers.length) best = { size, window };
+      if (!best) {
+        best = { size, window };
+        continue;
+      }
+      const bestFill = best.window.inliers.length / (best.size * best.size);
+      const fill = window.inliers.length / (size * size);
+      if (window.inliers.length > best.window.inliers.length && fill >= bestFill - LARGER_SIZE_FILL_SLACK) {
+        best = { size, window };
+      }
     }
     return best;
   };

@@ -102,8 +102,18 @@ export interface BoardView {
    * the classifier saw. Toggles the current state when `on` is omitted.
    * No-op before a lock. */
   toggleReview(on?: boolean): void;
+  /** Row-major indices of cells the player has tapped as wrong in the review
+   * grid — see `buildReviewGrid`. Empty before any tap, or before a lock. */
+  getFlaggedCells(): readonly number[];
   readonly locked: boolean;
   readonly reviewing: boolean;
+}
+
+export interface BoardViewHandlers {
+  /** Fires whenever a tap in the review grid changes which cells are
+   * flagged wrong — lets the caller enable/label a "report" action without
+   * polling `getFlaggedCells()` every frame. */
+  onFlagsChanged?(indices: readonly number[]): void;
 }
 
 /** Curve data for one word's path: a dense polyline plus its cumulative arc
@@ -158,7 +168,11 @@ function quadToMatrix3d(quad: readonly [Point, Point, Point, Point], boxWidth: n
   return `matrix3d(${values.join(",")})`;
 }
 
-export function mountBoardView(container: HTMLElement, video: HTMLVideoElement): BoardView {
+export function mountBoardView(
+  container: HTMLElement,
+  video: HTMLVideoElement,
+  handlers: BoardViewHandlers = {},
+): BoardView {
   // The board is always square (see boggle/board.ts), but the stage is a
   // fixed 3:4 portrait rect matching the camera framing (scanner.ts). Rather
   // than stretch the square board image to fill that rect, this wrapper is
@@ -199,6 +213,10 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
   let heatmapVisible = false;
   let gridSize = 5;
   let animationFrame: number | null = null;
+  /** Cells the player has tapped wrong in the review grid — see
+   * `buildReviewGrid`'s click handler. Cleared on every new lock, since a
+   * flag on cell 3 of one board means nothing about cell 3 of the next. */
+  const flaggedCells = new Set<number>();
 
   /** A single spark thrown off the wand tip. Additive-blended and fading, so
    * a handful drifting away from the head is what reads as "magic" rather
@@ -663,7 +681,11 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
 
   /** (Re)builds the letter-review grid from a lock's cells/letters/
    * confidences. Rebuilds the DOM each time rather than diffing — this only
-   * runs once per lock, not per frame. */
+   * runs once per lock, not per frame. Each cell is also a tap target: this
+   * is the "tell us which ones are wrong" UI — tapping toggles a flag rather
+   * than opening any correction input, so a report is just "here is a crop
+   * that is NOT the label everyone agrees the model gave it" — still a
+   * useful training signal without building a letter-entry keyboard. */
   function buildReviewGrid(
     cells: readonly PixelBuffer[],
     letters: readonly string[],
@@ -698,6 +720,18 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
         cellEl.append(confidenceLabel);
       }
 
+      const flagMark = document.createElement("span");
+      flagMark.className = "scanner-review-flag";
+      flagMark.textContent = "✕";
+      cellEl.append(flagMark);
+
+      cellEl.addEventListener("click", () => {
+        if (flaggedCells.has(i)) flaggedCells.delete(i);
+        else flaggedCells.add(i);
+        cellEl.classList.toggle("scanner-review-cell--flagged", flaggedCells.has(i));
+        handlers.onFlagsChanged?.([...flaggedCells].sort((a, b) => a - b));
+      });
+
       reviewGrid.append(cellEl);
     }
   }
@@ -716,6 +750,7 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     gridSize = params.gridSize;
     reviewing = false;
     reviewGrid.hidden = true;
+    flaggedCells.clear();
     buildReviewGrid(params.cells, params.letters, params.confidences, params.gridSize);
     // The quad's on-screen position has to be computed against the video's
     // own displayed rect (it matches `object-fit: cover`, same as the live
@@ -777,6 +812,7 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     heatmapCanvas.hidden = true;
     reviewGrid.hidden = true;
     reviewGrid.innerHTML = "";
+    flaggedCells.clear();
     clearTrail();
     clearHeatmap();
     boardCanvas.style.transition = "none";
@@ -792,6 +828,7 @@ export function mountBoardView(container: HTMLElement, video: HTMLVideoElement):
     showHeatmap,
     playFlourish,
     toggleReview,
+    getFlaggedCells: () => [...flaggedCells].sort((a, b) => a - b),
     get locked() {
       return locked;
     },

@@ -7,6 +7,7 @@ export interface SolveRequest {
   type: "solve";
   requestId: number;
   tiles: string[];
+  minWordLength: number;
 }
 
 export type WorkerRequest = InitMessage | SolveRequest;

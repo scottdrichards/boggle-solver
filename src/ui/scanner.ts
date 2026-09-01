@@ -26,31 +26,41 @@
  *    keeps voting; `onLocked` only fires again once the settled letters
  *    actually change, so holding the camera on a solved board is silent and
  *    swapping in a new one just works.
+ *
+ * 4. **Detection and classification run in a worker, not here** (2026-09-01
+ *    — see `../workers/pipeline.worker.ts`). This file's only per-frame
+ *    pixel work is capturing an `ImageBitmap` and handing it off; every
+ *    tfjs/CV cost that used to block this thread's rendering mid-scan now
+ *    happens off it, and a stuck GPU call can be killed outright
+ *    (`pipeline.terminate()`) instead of just abandoned. `pipeline` is a
+ *    `PipelineClient`, and its lifecycle is deliberately different from the
+ *    camera's: `stop()` releases the camera immediately on backgrounding,
+ *    but the worker gets a longer grace period before it's actually killed
+ *    (`PIPELINE_IDLE_MS`) — see the `visibilitychange` handler below.
  */
-import { CONFIDENT_INLIERS } from "../cv/gridDetector";
-import { sliceIntoCells, warpQuadToSquare, type PixelBuffer, type Point } from "../cv/quadWarp";
-import { getClassifier, getDetector, prefetchModels } from "../ml/models";
-import type { Prediction } from "../ml/classifier";
-import { activeBackend, tensorMemory } from "../ml/backend";
+import type { PixelBuffer, Point } from "../cv/quadWarp";
+import { PipelineClient, type PipelineFrameResult } from "../workers/pipelineClient";
+import type { PipelineFramePhases } from "../workers/pipelineProtocol";
 import { ScanConsensus, type LockedReading } from "./consensus";
-import { ScanTelemetry, type FramePhases } from "./telemetry";
+import { ScanTelemetry } from "./telemetry";
 import { mountBoardView, LOCK_TRANSITION_MS } from "./boardView";
-import { setTiles, state } from "./state";
+import { setGridSize, setTiles, state, type GridSize } from "./state";
 
-/** Frames are captured at this working size, matching the photo path so a
- * crop cut from a frame is the same kind of image the model was tuned on. */
-const WORKING_MAX_DIMENSION = 1400;
-/** Same endpoint `serveTLS.py`/`submitServer.py` already implement — see
- * "Report wrong board" below. Relative + BASE_URL-prefixed so it resolves
- * correctly whether served from `/` or GitHub Pages' subpath; on GitHub
- * Pages there is no server behind it and the POST just fails, which the
- * report handler treats the same as any other network error. */
-const SUBMIT_ENDPOINT = `${import.meta.env.BASE_URL}api/submit`;
-/** Detection-only grab size. The detector resamples every crop to 128x128
- * regardless, so detail here is wasted — and this readback happens on every
- * frame, including the ones that find nothing. */
-const DETECT_MAX_DIMENSION = 640;
-const WARP_OUTPUT_SIZE = 640;
+/** `cellSubmitServer.py`'s endpoints (see that script + the boggle brief's
+ * "abuse-resistant cell submission" entry) — a small stdlib server proxied
+ * at `/boggle/api/*` on the projects.scottdrichards.com box. Relative +
+ * BASE_URL-prefixed so this resolves correctly wherever the app is served;
+ * on GitHub Pages (static, no backend) the POST just fails, which the report
+ * handler treats the same as any other network error. */
+const TOKEN_ENDPOINT = `${import.meta.env.BASE_URL}api/token`;
+const SUBMIT_CELLS_ENDPOINT = `${import.meta.env.BASE_URL}api/submit-cells`;
+/** Flagged crops are a training sample, not a photo — small and cheap is
+ * strictly better here: the model's own input is 32x32, so 96px at modest
+ * JPEG quality already carries far more detail than the classifier uses,
+ * while keeping a full board's worth of flags a trivial upload even on a
+ * bad connection. */
+const CELL_EXPORT_SIZE = 96;
+const CELL_EXPORT_QUALITY = 0.7;
 /** Voting window. See consensus.ts: cells settle individually, so a single
  * flickering die cannot veto a board the other 24 cells agree on. */
 const CONSENSUS_OPTIONS = {
@@ -81,6 +91,22 @@ const WATCHDOG_CHECK_MS = 4000;
  * leave the error panel up — a device that can't hold a camera stream for
  * more than a few seconds needs a human, not another silent retry loop. */
 const MAX_AUTO_RECOVERIES = 3;
+
+/** How long a backgrounded tab keeps the CV/ML pipeline worker warm before
+ * it's actually killed. This is a separate, longer-fused decision from the
+ * camera itself: `stop()` releases the camera hardware immediately on
+ * backgrounding (pure battery drain otherwise, see the `visibilitychange`
+ * handler below), but the worker holds loaded tfjs models and compiled GPU
+ * kernels, which are comparatively expensive to reacquire — a `?debug=1`
+ * device measured 13-14s for first load under this project's slowest tested
+ * backend. Killing it on every brief backgrounding (a notification pull-down,
+ * a quick app switch) would trade a rare memory saving for a routine reload
+ * stall. Killing it *never* would defeat the point of moving the pipeline to
+ * a worker in the first place — an extended background stay should actually
+ * free the GPU/wasm memory, not just pause. This is the balance: reuse a
+ * still-warm worker across a quick switch, but let a real stay behind
+ * another app or a locked screen actually spin it down. */
+const PIPELINE_IDLE_MS = 20000;
 
 /** Breadcrumb for a freeze/crash with no console to read: written whenever
  * the camera is live, cleared only on a clean `pagehide`. If a future launch
@@ -142,11 +168,6 @@ export interface ScannerController {
   playFlourish(paths: readonly (readonly number[])[], totalMs: number): void;
 }
 
-interface FrameCapture {
-  buffer: PixelBuffer;
-  canvas: HTMLCanvasElement;
-}
-
 export function mountScanner(container: HTMLElement, handlers: ScannerHandlers): ScannerController {
   container.innerHTML = `
     <div class="scanner-stage" id="scanner-stage">
@@ -177,7 +198,11 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   const overlayCtx = overlay.getContext("2d")!;
   // Presentation after a lock: freezing the frame, animating the quad into a
   // flat square, and drawing a tapped word's trail on it. See boardView.ts.
-  const boardView = mountBoardView(stage, video);
+  // `onFlagsChanged` is how the review grid's tap-to-flag cells (also in
+  // boardView.ts) reach the report button below.
+  const boardView = mountBoardView(stage, video, {
+    onFlagsChanged: (indices) => updateReportButton(indices),
+  });
 
   // The board starts full-size so it's easy to read while scanning, but once
   // the player scrolls into the results list it shrinks and sticks to the
@@ -201,11 +226,19 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   const NATURAL_MAX_HEIGHT_VH = 70;
   const COMPACT_HEIGHT_VH = 22;
 
+  // The live video is 3:4 portrait, but the board it captures is always
+  // square (boggle/board.ts). Once locked there's no video left to frame —
+  // just the flattened square board — so the stage itself switches to a 1:1
+  // aspect instead of staying 3:4 with the square letterboxed inside it.
+  // Without this the locked board sat centered in a 3:4 box with black bars
+  // above and below, and the status text over those bars was barely legible.
+  let stageAspect = STAGE_ASPECT;
+
   function computeStageSize(targetHeightVh: number): { width: number; height: number } {
     const columnWidth = container.clientWidth || stage.clientWidth || 1;
     const heightCapPx = (targetHeightVh / 100) * window.innerHeight;
-    const height = Math.min(columnWidth / STAGE_ASPECT, heightCapPx);
-    return { width: height * STAGE_ASPECT, height };
+    const height = Math.min(columnWidth / stageAspect, heightCapPx);
+    return { width: height * stageAspect, height };
   }
 
   const COMPACT_ENTER_PX = 56;
@@ -242,17 +275,16 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   applyStageSize();
   updateCompactState();
 
-  // The capture surface. Never displayed, never drawn on by the UI — see the
-  // note at the top of this file about why that separation is structural.
-  const frameCanvas = document.createElement("canvas");
-  const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true })!;
-  frameCtx.imageSmoothingEnabled = true;
-  frameCtx.imageSmoothingQuality = "high";
-  /** Small buffer used for detection only — see `captureInto`. */
-  const detectCanvas = document.createElement("canvas");
-  const detectCtx = detectCanvas.getContext("2d", { willReadFrequently: true })!;
-  detectCtx.imageSmoothingEnabled = true;
-  detectCtx.imageSmoothingQuality = "high";
+  // Detection, warping, slicing and classification all happen in the CV/ML
+  // pipeline worker now — see pipelineClient.ts/pipeline.worker.ts and this
+  // file's header comment. The main thread's only per-frame pixel work is
+  // handing the worker an `ImageBitmap`; there is no capture canvas here to
+  // draw on by accident any more, which makes the old "never draw on the
+  // capture surface" invariant structural rather than just documented.
+  const pipeline = new PipelineClient();
+  /** Scheduled by the `visibilitychange` handler when the tab is hidden —
+   * see PIPELINE_IDLE_MS. Cleared if the tab becomes visible again first. */
+  let pipelineIdleTimer: number | null = null;
 
   let stream: MediaStream | null = null;
   let running = false;
@@ -269,6 +301,12 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   let pendingStop: number | null = null;
   let loopToken = 0;
   let quickLookMisses = 0;
+  /** Board size the current run of consensus votes assumes. The fitter picks
+   * a size fresh every frame (see `pipeline.worker.ts`'s `GRID_SIZES`), so a
+   * flip mid-scan is possible — treated the same as the board itself
+   * changing: the vote window can't mix readings of two different sizes, so
+   * it resets rather than silently mis-indexing cells. */
+  let scanGridSize: number | null = null;
   let startupMs = 0;
   /** Watchdog bookkeeping — see WATCHDOG_STALL_MS above. `lastProgressAt`
    * covers a stuck loop iteration; `startInitiatedAt` covers a `startInner()`
@@ -291,20 +329,71 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   const consensus = new ScanConsensus(CONSENSUS_OPTIONS);
   const telemetry = new ScanTelemetry();
 
-  /** Snapshot of the current lock, kept only so "Report wrong board" has
-   * something to send — there is no manual-correction UI any more (see the
-   * project brief), so this reports the board as-read rather than
-   * as-corrected. A human sorts flagged-vs-fine submissions out later from
-   * `meta.json`'s `reportedWrong` field, same pipeline the removed capture.ts
-   * fed via `/api/submit`. */
-  let pendingReport: {
-    photo: HTMLCanvasElement;
+  /** Snapshot of the current lock's per-cell crops, kept only so tapping a
+   * cell wrong in the review grid (boardView.ts) has something to submit —
+   * there is no manual-correction UI, so a report says "this crop is NOT
+   * this letter" rather than supplying the right one. Only the *flagged*
+   * cells are ever uploaded (see reportBtn below): a full-board photo is
+   * neither necessary for that signal nor as cheap to store. */
+  let pendingCells: {
+    cells: readonly PixelBuffer[];
     letters: string[];
     confidences: (number | null)[];
-    quad: [Point, Point, Point, Point];
-    frameWidth: number;
-    frameHeight: number;
+    gridSize: number;
   } | null = null;
+
+  /** Short-lived anti-abuse token from `cellSubmitServer.py`'s `/api/token`
+   * — proves a submission came from a client that actually loaded the app
+   * recently, not a bare script hitting the upload endpoint blind. Fetched
+   * once per scanner start and again lazily if a submit finds it missing or
+   * the server rejects it as expired; a failed fetch just leaves this null,
+   * and the submit attempt below surfaces that as a normal network error
+   * rather than crashing anything. */
+  let submitToken: string | null = null;
+
+  async function fetchSubmitToken(): Promise<void> {
+    try {
+      const response = await fetch(TOKEN_ENDPOINT);
+      if (!response.ok) return;
+      const body = (await response.json()) as { token?: string };
+      submitToken = body.token ?? null;
+    } catch {
+      // No backend behind this origin (e.g. GitHub Pages) — reporting will
+      // fail with the same "couldn't reach server" message it always had.
+      submitToken = null;
+    }
+  }
+
+  /** Downscales one classifier-input crop to a small JPEG for upload. Cheap
+   * relative to a full board photo by design — see `CELL_EXPORT_SIZE`. */
+  function exportCell(cell: PixelBuffer): Promise<Blob | null> {
+    const canvas = document.createElement("canvas");
+    canvas.width = cell.width;
+    canvas.height = cell.height;
+    canvas.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(cell.data), cell.width, cell.height), 0, 0);
+    const small = document.createElement("canvas");
+    small.width = CELL_EXPORT_SIZE;
+    small.height = CELL_EXPORT_SIZE;
+    const smallCtx = small.getContext("2d")!;
+    smallCtx.imageSmoothingEnabled = true;
+    smallCtx.imageSmoothingQuality = "high";
+    smallCtx.drawImage(canvas, 0, 0, CELL_EXPORT_SIZE, CELL_EXPORT_SIZE);
+    return new Promise((resolve) => small.toBlob(resolve, "image/jpeg", CELL_EXPORT_QUALITY));
+  }
+
+  /** Reflects the review grid's current flags onto the report button — shown
+   * only once at least one cell is flagged, since "report nothing" isn't an
+   * action. Re-derived from `boardView.getFlaggedCells()` on every tap
+   * rather than tracked separately here. */
+  function updateReportButton(indices: readonly number[]): void {
+    if (indices.length === 0) {
+      reportBtn.hidden = true;
+      return;
+    }
+    reportBtn.hidden = false;
+    reportBtn.disabled = false;
+    reportBtn.textContent = `Report ${indices.length} wrong letter${indices.length === 1 ? "" : "s"}`;
+  }
 
   /** On-screen diagnostics, opt-in via `?debug=1`. There is no console on a
    * phone, and these were how the aspect-distortion bug got found — but the
@@ -319,6 +408,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     detectMs: 0,
     classifyMs: 0,
     inliers: 0,
+    gridCells: 25,
     dispatches: 0,
     deep: false,
     frames: 0,
@@ -336,7 +426,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       `backend  ${diagnostics.backend}   video ${diagnostics.resolution}`,
       `detect   ${diagnostics.detectMs.toFixed(0)}ms  (${diagnostics.dispatches} dispatch${
         diagnostics.dispatches === 1 ? "" : "es"
-      }${diagnostics.deep ? ", deep" : ""})  inliers ${diagnostics.inliers}/25`,
+      }${diagnostics.deep ? ", deep" : ""})  inliers ${diagnostics.inliers}/${diagnostics.gridCells}`,
       `classify ${diagnostics.classifyMs.toFixed(0)}ms`,
       `votes    ${diagnostics.frames} frames, ${diagnostics.unsettled} cells unsettled, conf ${diagnostics.meanConfidence.toFixed(
         2,
@@ -354,14 +444,21 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
    * too: a scan that feels slow may be spending its time failing to find the
    * board, which looks nothing like a scan that is slow to classify. */
   function recordFrame(
-    phases: Partial<FramePhases>,
+    phases: Partial<PipelineFramePhases>,
     deep: boolean,
     iterationStart: number,
     progress: { unsettled: number; meanConfidence: number },
   ): void {
-    const tensors = tensorMemory();
+    // Tensor accounting now lives in the pipeline worker (that's where tfjs
+    // runs) — the client just mirrors whatever the worker last reported,
+    // same as `activeBackend()`/`tensorMemory()` used to read module-level
+    // state directly on this thread pre-migration.
+    const tensors = pipeline.tensorStats;
     // Non-standard and Chromium-only; absent everywhere else, hence the cast
     // rather than a global type declaration for something that may not exist.
+    // Still read on the main thread deliberately: this is *this* thread's
+    // heap, not the worker's, and a scan can die from either — see
+    // telemetry.ts's `heapMB` doc comment.
     const heapBytes = (performance as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0;
     diagnostics.tensors = tensors.numTensors;
     diagnostics.tensorMB = tensors.numBytes / 1e6;
@@ -389,12 +486,13 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   }
 
   function sendTelemetry(outcome: "locked" | "cancelled", letters?: string[]): void {
+    const full = pipeline.fullResolution;
     telemetry.send(
       {
         userAgent: navigator.userAgent,
-        backend: activeBackend() ?? "unknown",
+        backend: pipeline.backend ?? "unknown",
         videoResolution: `${video.videoWidth}x${video.videoHeight}`,
-        workingResolution: `${frameCanvas.width}x${frameCanvas.height}`,
+        workingResolution: full ? `${full.width}x${full.height}` : "0x0",
         startupMs: startupMs,
         outcome,
       },
@@ -404,6 +502,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
 
   function setStatus(text: string): void {
     statusEl.textContent = text;
+    statusEl.hidden = false;
   }
 
   function showError(message: string, canRetry: boolean): void {
@@ -432,101 +531,6 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
-  /** Grabs the video into `canvas` at `maxDimension` and reads it back.
-   *
-   * Resolution is split in two because the two consumers need wildly
-   * different things. **Detection** downsamples every crop to 128x128 no
-   * matter what it is given, so feeding it a 788x1400 buffer is pure waste —
-   * and it is paid on every frame, including the ~93% that find nothing.
-   * Measured on-device, this readback alone was 26-36% of a whole scan.
-   * **Classification** is the opposite: its crops are cut straight from the
-   * buffer, so it wants all the detail available.
-   *
-   * So the loop detects on a small grab and, only once a board is actually
-   * found, pays for a full-resolution one to warp from. */
-  function captureInto(
-    canvas: HTMLCanvasElement,
-    ctx: CanvasRenderingContext2D,
-    maxDimension: number,
-  ): FrameCapture | null {
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (width === 0 || height === 0) return null;
-
-    const scale = Math.min(1, maxDimension / Math.max(width, height));
-    const targetWidth = Math.round(width * scale);
-    const targetHeight = Math.round(height * scale);
-    // Only assign when the size actually changes. Assigning `canvas.width` is
-    // not a no-op when the value is unchanged: it resets the drawing surface
-    // and reallocates the backing store, which is native (often GPU) memory
-    // the JS heap does not account for and the browser reclaims lazily. This
-    // ran on *every* frame — ~0.9 MB for the detect grab plus ~4.4 MB for the
-    // full-resolution one — so a camera left running churned tens of MB per
-    // second of allocations nothing in the JS profile would show. Which is
-    // exactly the shape of "left it up for a while and the tab died".
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-      // Resizing resets context state, so the smoothing hints set at creation
-      // have to be reapplied. They were silently being reset every frame
-      // before, which is its own small bug.
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-    }
-    // The video frame is opaque and covers the canvas exactly, so the stale
-    // previous frame underneath is fully overwritten — no clear needed.
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return { buffer: ctx.getImageData(0, 0, canvas.width, canvas.height), canvas };
-  }
-
-  /** One look at one frame. `deep` spends the full coarse-to-fine pyramid;
-   * otherwise it is a single whole-frame pass, which is all a board held up
-   * to the camera needs. */
-  async function readFrame(frame: FrameCapture, deep: boolean, phases: Partial<FramePhases>) {
-    const detector = await getDetector();
-
-    const detectStart = performance.now();
-    const fit = await detector.detect(frame.buffer, {
-      gridSizes: [5],
-      // `scales: [1]` = the centred-square first look plus square crops
-      // covering the frame, all undistorted. It must NOT be `scales: []`:
-      // that left only the first look, and before the centred-square fix
-      // that look was an aspect-squashed whole frame which found the board
-      // in 3 frames out of 42.
-      ...(deep ? {} : { scales: [1], refine: true }),
-    });
-    phases.detectMs = performance.now() - detectStart;
-    phases.detectSampleMs = fit?.timings.sampleMs ?? 0;
-    phases.detectPredictMs = fit?.timings.predictMs ?? 0;
-    phases.detectFitMs = fit?.timings.fitMs ?? 0;
-    phases.inliers = fit?.inlierCount ?? 0;
-    phases.dispatches = fit?.batches ?? 0;
-    phases.passes = fit?.passes ?? 0;
-
-    if (!fit || fit.inlierCount < CONFIDENT_INLIERS) return { fit: null, cells: null };
-
-    // Board found, so now it is worth paying for detail: re-grab at full
-    // working resolution and scale the quad into that larger space.
-    const full = captureInto(frameCanvas, frameCtx, WORKING_MAX_DIMENSION) ?? frame;
-    const ratio = full.buffer.width / frame.buffer.width;
-    const quad = fit.quad.map((point) => ({ x: point.x * ratio, y: point.y * ratio })) as [
-      Point,
-      Point,
-      Point,
-      Point,
-    ];
-
-    const warpStart = performance.now();
-    const warped = warpQuadToSquare(full.buffer, quad, WARP_OUTPUT_SIZE);
-    phases.warpMs = performance.now() - warpStart;
-
-    const sliceStart = performance.now();
-    const cells = sliceIntoCells(warped, state.gridSize);
-    phases.sliceMs = performance.now() - sliceStart;
-
-    return { fit, cells, full, quad, warped };
-  }
-
   /** Pauses the video (so its last frame stays visible under the flatten
    * animation) and stops the read loop immediately, but only releases the
    * camera hardware once the animation has had time to fully cover it —
@@ -534,30 +538,26 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
    * `srcObject` drops the last frame instantly in most browsers. */
   function lockIn(
     locked: LockedReading,
-    quadInFrame: [Point, Point, Point, Point],
-    frame: FrameCapture,
+    quadInFrame: readonly [Point, Point, Point, Point],
+    detectWidth: number,
+    detectHeight: number,
     warped: PixelBuffer,
     cells: readonly PixelBuffer[],
-    fullFrame: FrameCapture,
-    fullQuad: [Point, Point, Point, Point],
   ): void {
     setTiles(locked.letters);
     sendTelemetry("locked", locked.letters);
 
-    // Full working-resolution photo + the quad scaled to match it — same
-    // pair `readFrame` used to warp/slice, so what gets submitted is exactly
-    // what the classifier saw, not the smaller detect-only grab `frame` is.
-    pendingReport = {
-      photo: fullFrame.canvas,
+    // The exact crops the classifier saw for this lock — reporting only ever
+    // sends whichever of these the player taps wrong in the review grid, so
+    // this is kept, not the full-resolution photo the old whole-board report
+    // used to be attached to.
+    pendingCells = {
+      cells,
       letters: [...locked.letters],
       confidences: [...locked.confidences],
-      quad: fullQuad,
-      frameWidth: fullFrame.buffer.width,
-      frameHeight: fullFrame.buffer.height,
+      gridSize: state.gridSize,
     };
-    reportBtn.hidden = false;
-    reportBtn.disabled = false;
-    reportBtn.textContent = "Report wrong board";
+    reportBtn.hidden = true; // shown once a cell is actually flagged wrong
 
     wantsToRun = false;
     running = false;
@@ -566,8 +566,8 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
 
     boardView.lock({
       quad: quadInFrame,
-      frameWidth: frame.buffer.width,
-      frameHeight: frame.buffer.height,
+      frameWidth: detectWidth,
+      frameHeight: detectHeight,
       board: warped,
       gridSize: state.gridSize,
       cells,
@@ -577,7 +577,12 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     reviewBtn.hidden = false;
     reviewBtn.textContent = "Review letters";
     rescanBtn.hidden = false;
-    setStatus("Board captured — tap a word to trace it, or scan a new board.");
+    // No status text once locked — the flattened board and the results list
+    // say everything that mattered, and the text used to hang over the
+    // stage's now-removed black bars, barely legible against them.
+    statusEl.hidden = true;
+    stageAspect = 1;
+    applyStageSize();
 
     // Cancelled by `start()`: tapping "Scan a new board" during the flatten
     // animation would otherwise have this fire a moment later and stop the
@@ -594,39 +599,41 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     while (running && token === loopToken) {
       lastProgressAt = performance.now();
       const iterationStart = performance.now();
-      const phases: Partial<FramePhases> = {};
-
-      const captureStart = performance.now();
-      const frame = captureInto(detectCanvas, detectCtx, DETECT_MAX_DIMENSION);
-      phases.captureMs = performance.now() - captureStart;
-      if (!frame) {
-        await nextFrame();
-        continue;
-      }
 
       const deep = quickLookMisses >= QUICK_LOOKS_BEFORE_PYRAMID;
-      diagnostics.backend = activeBackend() ?? "loading";
+      diagnostics.backend = pipeline.backend ?? "loading";
       diagnostics.resolution = `${video.videoWidth}x${video.videoHeight}`;
       diagnostics.deep = deep;
 
-      let result: Awaited<ReturnType<typeof readFrame>>;
+      let result: PipelineFrameResult | null;
       try {
-        result = await readFrame(frame, deep, phases);
+        result = await pipeline.runFrame(video, deep);
       } catch (error) {
-        // A failure here is the interesting case and used to vanish into the
-        // console, where a phone user could never see it.
+        // Covers both a detect-phase and a classify-phase failure in the
+        // worker (see pipelineClient.ts's `frame-error` handling) — same
+        // treatment either way the original code gave each separately: log
+        // it (it used to vanish into a console a phone user could never see),
+        // skip the frame, and let the loop keep going.
+        if (token !== loopToken) return;
         console.error("scanner frame failed", error);
-        diagnostics.note = `detect failed: ${String(error).slice(0, 90)}`;
+        diagnostics.note = `pipeline failed: ${String(error).slice(0, 90)}`;
         renderDiagnostics();
         await nextFrame();
         continue;
       }
-      diagnostics.detectMs = phases.detectMs ?? 0;
-      diagnostics.inliers = phases.inliers ?? 0;
-      diagnostics.dispatches = phases.dispatches ?? 0;
       if (token !== loopToken) return;
 
-      if (!result.fit || !result.cells) {
+      if (!result) {
+        // Video not ready yet (0x0) — not a miss, just nothing to read.
+        await nextFrame();
+        continue;
+      }
+
+      diagnostics.detectMs = result.phases.detectMs ?? 0;
+      diagnostics.inliers = result.phases.inliers ?? 0;
+      diagnostics.dispatches = result.phases.dispatches ?? 0;
+
+      if (!result.fit || !result.cells || !result.warped || !result.predictions) {
         // A deep scan that found nothing goes back to the cheap cadence
         // rather than pinning every later frame to the pyramid: if the board
         // isn't there, it is not worth paying the expensive look every frame.
@@ -638,38 +645,29 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
         drawOverlay();
         setStatus(deep ? "Looking for the board…" : "Point the camera at the board");
         renderDiagnostics();
-        recordFrame(phases, deep, iterationStart, consensus.progress());
+        recordFrame(result.phases, deep, iterationStart, consensus.progress());
         await nextFrame();
         continue;
       }
 
       quickLookMisses = 0;
-      drawOverlay();
-
-      const classifyStart = performance.now();
-      let predictions: Prediction[];
-      try {
-        const classifier = await getClassifier();
-        predictions = await classifier.classifyCells(result.cells);
-      } catch (error) {
-        // Unlike readFrame's catch, this used to be unguarded: a failure here
-        // (classifier.classifyCells retries once internally and can still
-        // throw, e.g. two backends both unavailable) would escape the loop
-        // entirely — the camera stayed live with nothing reading it, which
-        // looks exactly like a freeze with no error ever shown.
-        console.error("scanner classify failed", error);
-        diagnostics.note = `classify failed: ${String(error).slice(0, 90)}`;
-        renderDiagnostics();
-        await nextFrame();
-        continue;
+      diagnostics.gridCells = result.fit.gridSize * result.fit.gridSize;
+      if (result.fit.gridSize !== scanGridSize) {
+        // The window can't mix votes for two different sizes — a "cell 5" on
+        // a 4-wide board and a 5-wide board isn't the same square. Treated
+        // like the board itself changing size mid-scan (rare, but the fit is
+        // a fresh guess every frame): drop the old votes and start settling
+        // the newly-sized board instead.
+        consensus.reset();
+        scanGridSize = result.fit.gridSize;
       }
-      phases.classifyMs = performance.now() - classifyStart;
-      diagnostics.classifyMs = phases.classifyMs;
-      if (token !== loopToken) return;
+      setGridSize(result.fit.gridSize as GridSize);
+      drawOverlay();
+      diagnostics.classifyMs = result.phases.classifyMs ?? 0;
 
       const locked = consensus.add({
-        letters: predictions.map((p) => (p.label === "?" ? "" : p.label)),
-        confidences: predictions.map((p) => p.confidence),
+        letters: result.predictions.map((p) => (p.label === "?" ? "" : p.label)),
+        confidences: result.predictions.map((p) => p.confidence),
       });
 
       const progress = consensus.progress();
@@ -678,15 +676,15 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       diagnostics.meanConfidence = progress.meanConfidence;
       diagnostics.note = "";
       renderDiagnostics();
-      recordFrame(phases, deep, iterationStart, progress);
+      recordFrame(result.phases, deep, iterationStart, progress);
 
       if (locked) {
-        lockIn(locked, result.fit.quad, frame, result.warped, result.cells, result.full, result.quad);
+        lockIn(locked, result.fit.quad, result.detectWidth, result.detectHeight, result.warped, result.cells);
         return; // camera is stopped inside lockIn; nothing left for this loop to do
       } else {
         setStatus(
           progress.unsettled > 0
-            ? `Reading… ${progress.unsettled} of 25 still unsettled`
+            ? `Reading… ${progress.unsettled} of ${progress.cells.length} still unsettled`
             : `Reading… hold steady (confidence ${progress.meanConfidence.toFixed(2)})`,
         );
       }
@@ -752,7 +750,14 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   async function startInner(): Promise<void> {
     // Kick the downloads off before asking for the camera: the permission
     // prompt and stream negotiation are dead time the fetches can hide behind.
-    prefetchModels();
+    // Also cancels any pending idle-termination of the pipeline worker (see
+    // the `visibilitychange` handler below) — a no-op if it's already live.
+    if (pipelineIdleTimer !== null) {
+      clearTimeout(pipelineIdleTimer);
+      pipelineIdleTimer = null;
+    }
+    pipeline.ensureStarted();
+    if (!submitToken) void fetchSubmitToken();
     consensus.reset();
     quickLookMisses = 0;
     setStatus("Starting camera…");
@@ -818,9 +823,18 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   /** Forces the camera loop back to a known state after the watchdog decides
    * nothing has progressed in too long — see WATCHDOG_STALL_MS. Abandons any
    * stuck `starting`/`loop` in place rather than waiting on it (a hung
-   * promise can't be cancelled), tears down whatever camera state exists,
-   * and tries once more, bounded by MAX_AUTO_RECOVERIES so a device that
-   * genuinely can't hold a stream doesn't retry forever in the background. */
+   * camera-side promise still can't be cancelled), tears down whatever
+   * camera state exists, and tries once more, bounded by MAX_AUTO_RECOVERIES
+   * so a device that genuinely can't hold a stream doesn't retry forever in
+   * the background.
+   *
+   * The pipeline worker gets different treatment: `pipeline.terminate()`
+   * actually cancels whatever it was doing, deterministically, instead of
+   * being abandoned. This is the reliable half of moving the CV/ML pipeline
+   * off the main thread — before, a stuck detect/classify call inside
+   * `readFrame` could only be left running forever; now the stall recovery
+   * can kill it outright and `startInner()`'s `pipeline.ensureStarted()`
+   * spins up a clean one on the retry below. */
   function recoverFromStall(reason: string): void {
     console.warn(`scanner watchdog: ${reason}`);
     autoRecoveries++;
@@ -828,6 +842,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     starting = null;
     startInitiatedAt = null;
     stop();
+    pipeline.terminate();
     if (autoRecoveries > MAX_AUTO_RECOVERIES) {
       showError("The camera keeps stalling on this device. Reload the page.", true);
       diagnostics.note = `watchdog: gave up after ${autoRecoveries} recoveries`;
@@ -860,28 +875,56 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   // mobile, including bfcache navigations.
   window.addEventListener("pagehide", () => {
     stop();
+    // No grace period here, unlike the visibilitychange path below — the
+    // page is actually going away, not just hidden, so there is no "quick
+    // switch back" case to optimise for.
+    if (pipelineIdleTimer !== null) {
+      clearTimeout(pipelineIdleTimer);
+      pipelineIdleTimer = null;
+    }
+    pipeline.terminate();
     // The one case that counts as a clean exit for the stale-heartbeat check
     // — every other path that reaches here (backgrounding, a watchdog
     // recovery) deliberately leaves a breadcrumb behind instead.
     clearHeartbeat();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden" && running) {
-      // A backgrounded tab cannot paint, so a scan there is pure battery
-      // drain on a stream the user cannot see. Pause rather than stall —
-      // `wantsToRun` survives this so returning to the tab resumes on its own.
-      sendTelemetry("cancelled");
-      const shouldResume = wantsToRun;
-      stop();
-      wantsToRun = shouldResume;
-      // Distinct from the "running"/"recovered-from-stall" phases: an OS
-      // reclaiming a backgrounded tab is expected, not evidence of the freeze
-      // this is meant to catch. Left in place (not cleared) so a resume that
-      // never gets going again still leaves *some* trace of the last known
-      // state, just not an alarming one.
-      writeHeartbeat({ phase: "backgrounded" });
-    } else if (document.visibilityState === "visible" && wantsToRun && !running) {
-      void start();
+    if (document.visibilityState === "hidden") {
+      if (running) {
+        // A backgrounded tab cannot paint, so a scan there is pure battery
+        // drain on a stream the user cannot see. Pause rather than stall —
+        // `wantsToRun` survives this so returning to the tab resumes on its own.
+        sendTelemetry("cancelled");
+        const shouldResume = wantsToRun;
+        stop();
+        wantsToRun = shouldResume;
+        // Distinct from the "running"/"recovered-from-stall" phases: an OS
+        // reclaiming a backgrounded tab is expected, not evidence of the freeze
+        // this is meant to catch. Left in place (not cleared) so a resume that
+        // never gets going again still leaves *some* trace of the last known
+        // state, just not an alarming one.
+        writeHeartbeat({ phase: "backgrounded" });
+      }
+      // The pipeline worker gets a longer, separate fuse than the camera —
+      // see PIPELINE_IDLE_MS. Scheduled whenever the worker is actually live,
+      // regardless of whether a scan was running: a worker left warm after a
+      // lock (waiting for "Scan a new board") holds exactly the same loaded-
+      // model memory while backgrounded as one mid-scan.
+      if (pipeline.isLive && pipelineIdleTimer === null) {
+        pipelineIdleTimer = window.setTimeout(() => {
+          pipelineIdleTimer = null;
+          pipeline.terminate();
+        }, PIPELINE_IDLE_MS);
+      }
+    } else if (document.visibilityState === "visible") {
+      // Back before the grace period elapsed — the worker (if still live)
+      // needs no reload at all; if it already got terminated, `start()`'s
+      // `pipeline.ensureStarted()` recreates it lazily.
+      if (pipelineIdleTimer !== null) {
+        clearTimeout(pipelineIdleTimer);
+        pipelineIdleTimer = null;
+      }
+      if (wantsToRun && !running) void start();
     }
   });
 
@@ -895,60 +938,61 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     reviewBtn.textContent = boardView.reviewing ? "Show board" : "Review letters";
   });
 
-  /** Sends the current lock to `/api/submit` as a flagged-wrong training
-   * sample: the full-res photo plus the board *as read*, since there is no
-   * manual-correction UI to supply a fix (see the project brief on the UI
-   * strip-down). `photo.toBlob` reads the canvas's pixels synchronously at
-   * this call, before any `await`, so a "Scan a new board" tap racing the
-   * upload can't corrupt it — `frameCanvas` gets reused by the next lock. */
-  reportBtn.addEventListener("click", () => {
-    const report = pendingReport;
-    if (!report) return;
+  /** Sends only the cells the player tapped wrong in the review grid to
+   * `cellSubmitServer.py`'s `/api/submit-cells` — small JPEGs, not a full
+   * board photo, and gated by `submitToken` so a bare script hitting the
+   * endpoint without ever loading the app gets rejected server-side. There
+   * is no manual-correction UI, so this reports "not this letter" rather
+   * than supplying the right one — see `pendingCells`'s comment. */
+  reportBtn.addEventListener("click", async () => {
+    const pending = pendingCells;
+    const indices = boardView.getFlaggedCells();
+    if (!pending || indices.length === 0) return;
     reportBtn.disabled = true;
     reportBtn.textContent = "Reporting…";
-    report.photo.toBlob(
-      (blob) => {
-        if (!blob) {
-          reportBtn.disabled = false;
-          reportBtn.textContent = "Couldn't report — tap to retry";
-          return;
-        }
-        const meta = {
-          letters: report.letters,
-          predictions: report.letters,
-          confidences: report.confidences,
-          quad: report.quad,
-          frameWidth: report.frameWidth,
-          frameHeight: report.frameHeight,
-          gridSize: state.gridSize,
-          reportedWrong: true,
-        };
-        const form = new FormData();
-        form.append("photo", blob, "photo.jpg");
-        form.append("meta", JSON.stringify(meta));
-        fetch(SUBMIT_ENDPOINT, { method: "POST", body: form })
-          .then((response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            reportBtn.textContent = "Reported — thanks";
-          })
-          .catch((error) => {
-            console.warn("submit report failed", error);
-            reportBtn.disabled = false;
-            reportBtn.textContent = "Couldn't reach server — tap to retry";
-          });
-      },
-      "image/jpeg",
-      0.92,
-    );
+
+    if (!submitToken) await fetchSubmitToken();
+    if (!submitToken) {
+      reportBtn.disabled = false;
+      reportBtn.textContent = "Couldn't reach server — tap to retry";
+      return;
+    }
+
+    try {
+      const form = new FormData();
+      const meta = indices.map((index) => ({
+        index,
+        letter: pending.letters[index] ?? "",
+        confidence: pending.confidences[index] ?? null,
+      }));
+      form.append("meta", JSON.stringify({ gridSize: pending.gridSize, cells: meta }));
+      for (const index of indices) {
+        const blob = await exportCell(pending.cells[index]!);
+        if (blob) form.append(`cell_${index}`, blob, `cell_${index}.jpg`);
+      }
+      const response = await fetch(SUBMIT_CELLS_ENDPOINT, {
+        method: "POST",
+        headers: { "X-Boggle-Token": submitToken },
+        body: form,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      reportBtn.textContent = "Reported — thanks";
+    } catch (error) {
+      console.warn("submit report failed", error);
+      reportBtn.disabled = false;
+      reportBtn.textContent = "Couldn't reach server — tap to retry";
+    }
   });
 
   rescanBtn.addEventListener("click", () => {
     rescanBtn.hidden = true;
     reviewBtn.hidden = true;
     reportBtn.hidden = true;
-    pendingReport = null;
+    pendingCells = null;
     boardView.reset();
     video.style.opacity = "1";
+    stageAspect = STAGE_ASPECT;
+    applyStageSize();
     void start();
   });
 

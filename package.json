@@ -12,11 +12,12 @@
     "pretest": "npm run build:wordlist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "pretest:e2e": "npm run predev",
+    "pretest:e2e": "npm run predev && npm run build:e2e-fixtures",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
     "build:wordlist": "tsx scripts/buildWordlist.ts",
+    "build:e2e-fixtures": "bash scripts/buildE2eFixtures.sh",
     "copy:wasm": "tsx scripts/copyWasm.ts"
   },
   "dependencies": {

@@ -46,12 +46,21 @@ export class SolverClient {
     this.worker.postMessage(message, [buffer]);
   }
 
-  solve(tiles: string[]): Promise<SolveOutcome> {
+  solve(tiles: string[], minWordLength: number): Promise<SolveOutcome> {
     const requestId = this.nextRequestId++;
     return new Promise((resolve) => {
       this.pending.set(requestId, resolve);
-      const message: WorkerRequest = { type: "solve", requestId, tiles };
+      const message: WorkerRequest = { type: "solve", requestId, tiles, minWordLength };
       this.worker.postMessage(message);
     });
+  }
+
+  /** Releases the worker on page teardown. This one holds no camera/GPU
+   * state and costs nothing while idle, so — unlike `pipelineClient.ts`'s
+   * worker — there's no case for tearing it down on backgrounding, only on
+   * `pagehide`, for the same general hygiene: every worker this app creates
+   * should have an explicit, reachable path to actually stop. */
+  terminate(): void {
+    this.worker.terminate();
   }
 }

@@ -28,7 +28,7 @@ self.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
   if (message.type === "solve") {
     if (!trie) return; // client gates solve requests on dictionary-status "ready"
     const board = createBoard(message.tiles);
-    const found = solve(board, trie);
+    const found = solve(board, trie, message.minWordLength);
     const scored = scoreWords(found);
     post({
       type: "solve-result",

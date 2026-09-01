@@ -16,9 +16,14 @@
  * `?backend=wasm` (or localStorage `boggle.backend`) to force one.
  */
 import * as tf from "@tensorflow/tfjs";
+import { BACKEND_CHAIN, requestedBackend, type BackendName } from "./backendChain";
 
-export const BACKEND_CHAIN = ["webgpu", "webgl", "wasm", "cpu"] as const;
-export type BackendName = (typeof BACKEND_CHAIN)[number];
+// Re-exported so existing callers (classifier.ts, boardDetector.ts,
+// pipeline.worker.ts, benchmark.ts) don't need to change imports — only
+// `pipelineClient.ts` (main thread) imports `backendChain.ts` directly,
+// specifically to avoid pulling tf.js in with it. See that file's doc
+// comment for why the split exists.
+export { BACKEND_CHAIN, requestedBackend, type BackendName };
 
 /** Where the WASM binaries are served from. They are copied out of
  * node_modules into `public/tfjs-wasm/` by `scripts/copyWasm.ts` — tfjs
@@ -43,21 +48,6 @@ async function activate(backend: BackendName): Promise<void> {
   }
   await tf.setBackend(backend);
   await tf.ready();
-}
-
-/** Explicit override, for benchmarking and for pinning a device that turns
- * out to have a bad driver. Unrecognised values are ignored. */
-function requestedBackend(): BackendName | null {
-  const fromQuery = new URLSearchParams(location.search).get("backend");
-  const stored = (() => {
-    try {
-      return localStorage.getItem("boggle.backend");
-    } catch {
-      return null; // Private mode / storage disabled — not worth failing over.
-    }
-  })();
-  const name = fromQuery ?? stored;
-  return BACKEND_CHAIN.includes(name as BackendName) ? (name as BackendName) : null;
 }
 
 /** A `requestDevice()`/`setBackend()` call has no timeout of its own, and on
@@ -102,17 +92,24 @@ async function selectFrom(startIndex: number): Promise<BackendName> {
 let selection: Promise<BackendName> | null = null;
 
 /** Resolves once a backend is live. Memoized: both models call it, and the
- * second caller must not re-run backend init while the first is mid-flight. */
-export function ensureBackend(): Promise<BackendName> {
+ * second caller must not re-run backend init while the first is mid-flight.
+ *
+ * `forced`, when passed, skips `requestedBackend()` entirely and uses this
+ * value instead — how `pipeline.worker.ts` honours the page's `?backend=`/
+ * `localStorage` override despite not being able to read either itself: the
+ * main thread resolves `requestedBackend()` and sends the result in over
+ * `postMessage`. Omit it (main-thread callers, benchmark.ts, tests) to keep
+ * reading the page directly, as before. */
+export function ensureBackend(forced?: BackendName | null): Promise<BackendName> {
   if (!selection) {
     selection = (async () => {
-      const forced = requestedBackend();
-      if (forced) {
+      const requested = forced !== undefined ? forced : requestedBackend();
+      if (requested) {
         try {
-          await activate(forced);
-          return forced;
+          await activate(requested);
+          return requested;
         } catch (error) {
-          console.warn(`forced backend "${forced}" unavailable, falling back`, error);
+          console.warn(`forced backend "${requested}" unavailable, falling back`, error);
         }
       }
       return selectFrom(0);

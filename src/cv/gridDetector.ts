@@ -52,8 +52,10 @@ export interface GridDetectorOptions extends LatticeFitOptions {
   /** Crop stride as a fraction of crop side. 0.5 gives 50% overlap, so a
    * board can't fall permanently across a seam. */
   readonly stride?: number;
-  /** Stop scanning once a fit reaches this many inliers. */
-  readonly sufficientInliers?: number;
+  /** Stop scanning once a fit's fill (inliers / gridSize^2) reaches this
+   * fraction. A fraction rather than a raw count so it means the same thing
+   * whether the fitted lattice turned out to be 4x4 or 5x5. */
+  readonly sufficientFill?: number;
 }
 
 /** Where a scan's wall-clock actually went. Split three ways because these
@@ -82,18 +84,21 @@ export interface GridDetection extends LatticeFit {
 export interface Rect { x: number; y: number; width: number; height: number }
 
 /**
- * Dice on the fitted lattice below which a quad is usually wrong. Measured on
- * 45 reviewed photos: at >=22 inliers, 39 of 40 detections put every cell in
- * the right place.
+ * Fill (inliers / gridSize^2) below which a quad is usually wrong. Measured
+ * on 45 reviewed 5x5 photos: at >=22/25 = 0.88 fill, 39 of 40 detections put
+ * every cell in the right place. Expressed as a fraction, not a raw inlier
+ * count, so the same threshold means the same thing for a 4x4 board (>=14/16)
+ * as for a 5x5 one — a raw count of 22 can never be reached on a 16-site
+ * board and would silently refuse to ever lock a classic 4x4 game.
  *
  * This is deliberately also the scan's early-exit threshold. It used to stop
- * only at a *perfect* 25, while both callers were happy to trust 22 — so a
- * board reading 23 or 24 (an occluded corner, one die at an angle) made the
- * scan grind through all 88 crops to confirm what it already had at crop 2.
- * On-device that cliff cost ~700 ms per scan. Perfect-or-exhaustive is a bad
- * bargain whenever "good enough" is a published number.
+ * only at a *perfect* board, while both callers were happy to trust 0.88 —
+ * so a board reading 23 or 24 of 25 (an occluded corner, one die at an angle)
+ * made the scan grind through all 88 crops to confirm what it already had at
+ * crop 2. On-device that cliff cost ~700 ms per scan. Perfect-or-exhaustive
+ * is a bad bargain whenever "good enough" is a published number.
  */
-export const CONFIDENT_INLIERS = 22;
+export const CONFIDENT_FILL = 22 / 25;
 
 /** A fit together with the crop it came from. */
 interface Candidate { fit: LatticeFit; region: Rect }
@@ -106,7 +111,7 @@ const DEFAULTS = {
   refine: true,
   scales: [1, 0.5, 0.25],
   stride: 0.5,
-  sufficientInliers: CONFIDENT_INLIERS,
+  sufficientFill: CONFIDENT_FILL,
   maxBatch: 24,
 } as const;
 
@@ -261,7 +266,7 @@ export async function detectGrid(
   const refine = options.refine ?? DEFAULTS.refine;
   const scales = options.scales ?? DEFAULTS.scales;
   const stride = options.stride ?? DEFAULTS.stride;
-  const sufficient = options.sufficientInliers ?? DEFAULTS.sufficientInliers;
+  const sufficient = options.sufficientFill ?? DEFAULTS.sufficientFill;
   const maxBatch = Math.max(1, options.maxBatch ?? DEFAULTS.maxBatch);
   const fitOptions = { ...options, outputSize, peakThreshold };
 
@@ -306,7 +311,7 @@ export async function detectGrid(
     for (let start = 0; start < level.length; start += maxBatch) {
       const candidate = await evaluate(level.slice(start, start + maxBatch));
       if (candidate && (!best || candidate.fit.inlierCount > best.fit.inlierCount)) best = candidate;
-      if (best && best.fit.inlierCount >= sufficient) break outer;
+      if (best && best.fit.fill >= sufficient) break outer;
     }
   }
   if (!best) return null;
