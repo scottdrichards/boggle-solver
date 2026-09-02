@@ -33,8 +33,14 @@
  */
 import { CONFIDENT_FILL, type GridDetection } from "../cv/gridDetector";
 import { sliceIntoCells, warpQuadToSquare, type PixelBuffer, type Point } from "../cv/quadWarp";
-import { getClassifier, getDetector } from "../ml/models";
-import { activeBackend, ensureBackend, tensorMemory, type BackendName } from "../ml/backend";
+import { getClassifier, getDetector, setAssetBase as setModelAssetBase } from "../ml/models";
+import {
+  activeBackend,
+  ensureBackend,
+  setAssetBase as setWasmAssetBase,
+  tensorMemory,
+  type BackendName,
+} from "../ml/backend";
 import type {
   FrameErrorMessage,
   FrameMessage,
@@ -106,8 +112,13 @@ function toTransferable(buffer: PixelBuffer): TransferablePixelBuffer {
   return { width: buffer.width, height: buffer.height, data: buffer.data };
 }
 
-async function handleInit(backendOverride: BackendName | null): Promise<void> {
+async function handleInit(backendOverride: BackendName | null, assetBase: string): Promise<void> {
   try {
+    // Must happen before ensureBackend()/getDetector()/getClassifier() ever
+    // touch a URL — both default to a relative path that's wrong inside a
+    // worker. See ml/models.ts's `assetBase` doc comment.
+    setModelAssetBase(assetBase);
+    setWasmAssetBase(assetBase);
     await ensureBackend(backendOverride);
     // Load both up front rather than lazily on first frame: the whole point
     // of the main thread calling this the moment the scanner opens (mirrors
@@ -247,7 +258,7 @@ async function handleFrame(message: FrameMessage): Promise<void> {
 self.addEventListener("message", (event: MessageEvent<PipelineRequest>) => {
   const message = event.data;
   if (message.type === "init") {
-    void handleInit(message.backendOverride);
+    void handleInit(message.backendOverride, message.assetBase);
   } else if (message.type === "frame") {
     void handleFrame(message);
   }

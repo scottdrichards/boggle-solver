@@ -27,8 +27,19 @@ export { BACKEND_CHAIN, requestedBackend, type BackendName };
 
 /** Where the WASM binaries are served from. They are copied out of
  * node_modules into `public/tfjs-wasm/` by `scripts/copyWasm.ts` — tfjs
- * fetches them at runtime by name, so they cannot be bundled. */
-const WASM_PATH = `${import.meta.env.BASE_URL}tfjs-wasm/`;
+ * fetches them at runtime by name, so they cannot be bundled.
+ *
+ * Defaults to `import.meta.env.BASE_URL` (relative — this app builds with
+ * `base: "./"`), correct only when resolved on the main thread. Inside a
+ * worker a relative path resolves against the worker script's own URL, not
+ * the page's — see `ml/models.ts`'s `assetBase` doc comment for the full
+ * story (same bug, same fix, this is the WASM-path half of it).
+ * `pipeline.worker.ts` calls `setAssetBase()` before touching this. */
+let assetBase = import.meta.env.BASE_URL;
+
+export function setAssetBase(base: string): void {
+  assetBase = base;
+}
 
 let loadedWasm = false;
 
@@ -42,7 +53,7 @@ async function activate(backend: BackendName): Promise<void> {
       // which GitHub Pages cannot send, so in production this resolves to the
       // single-threaded SIMD build. tfjs picks that up on its own from the
       // failed threads probe; we only have to serve all three binaries.
-      wasm.setWasmPaths(WASM_PATH);
+      wasm.setWasmPaths(`${assetBase}tfjs-wasm/`);
       loadedWasm = true;
     }
   }
@@ -106,7 +117,12 @@ export function ensureBackend(forced?: BackendName | null): Promise<BackendName>
       const requested = forced !== undefined ? forced : requestedBackend();
       if (requested) {
         try {
-          await activate(requested);
+          // Same timeout as the automatic chain below — this path had none
+          // until now, a real gap: a forced backend (via `?backend=` or a
+          // stale `localStorage` value from earlier testing) that hangs
+          // instead of failing cleanly would block `ensureBackend()` forever
+          // with nothing to fall back to and no way for a caller to notice.
+          await withTimeout(activate(requested), BACKEND_ACTIVATE_TIMEOUT_MS, `activate(${requested})`);
           return requested;
         } catch (error) {
           console.warn(`forced backend "${requested}" unavailable, falling back`, error);

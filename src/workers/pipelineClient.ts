@@ -76,25 +76,47 @@ export class PipelineClient {
    * loading — fire-and-forget, same call-site contract as the old
    * `prefetchModels()`: call it right before `getUserMedia` so the
    * permission prompt and stream negotiation hide the download/shader-
-   * compile latency. Safe to call repeatedly; a no-op once live. */
+   * compile latency. Safe to call repeatedly; a no-op once live.
+   *
+   * Deliberately swallows a synchronous construction failure rather than
+   * letting it propagate — this is called from `scanner.ts`'s `startInner()`
+   * without a surrounding try/catch (it's meant to be fire-and-forget, like
+   * the `prefetchModels()` call it replaced), and an uncaught throw there
+   * would silently kill the whole `start()` promise chain before
+   * `getUserMedia` ever runs, with no error shown and nothing left to
+   * trigger the watchdog's recovery path (both `starting` and `running`
+   * settle to falsy with no error surfaced) — a worse failure mode than
+   * anything that existed before this worker did. `this.worker` stays
+   * `null` on failure, so the next `runFrame`/`ensureStarted()` call just
+   * retries. */
   ensureStarted(): void {
     if (this.worker) return;
-    const worker = new Worker(new URL("./pipeline.worker.ts", import.meta.url), { type: "module" });
-    worker.addEventListener("message", (event: MessageEvent<PipelineResponse>) => {
-      this.handleMessage(event.data);
-    });
-    worker.addEventListener("error", (event: ErrorEvent) => {
-      console.error("pipeline worker error", event.message);
-      // An error here means whatever the worker was doing when it happened
-      // is not going to finish — anyone awaiting a frame from it would hang
-      // forever otherwise. Treat it as a termination: fail pending, drop the
-      // reference, and let the caller's own retry path (scanner.ts's
-      // watchdog, or the next `runFrame`) recreate it.
-      this.terminate();
-    });
-    this.worker = worker;
-    const init: InitMessage = { type: "init", backendOverride: requestedBackend() };
-    worker.postMessage(init);
+    try {
+      const worker = new Worker(new URL("./pipeline.worker.ts", import.meta.url), { type: "module" });
+      worker.addEventListener("message", (event: MessageEvent<PipelineResponse>) => {
+        this.handleMessage(event.data);
+      });
+      worker.addEventListener("error", (event: ErrorEvent) => {
+        console.error("pipeline worker error", event.message);
+        // An error here means whatever the worker was doing when it happened
+        // is not going to finish — anyone awaiting a frame from it would hang
+        // forever otherwise. Treat it as a termination: fail pending, drop the
+        // reference, and let the caller's own retry path (scanner.ts's
+        // watchdog, or the next `runFrame`) recreate it.
+        this.terminate();
+      });
+      this.worker = worker;
+      // Absolute, not relative: `import.meta.env.BASE_URL` ("./" in this app)
+      // only resolves correctly against a known document location, and the
+      // worker's own script URL is the wrong one — see InitMessage's doc
+      // comment and ml/models.ts's `assetBase` for the bug this avoids.
+      const assetBase = new URL(import.meta.env.BASE_URL, location.href).href;
+      const init: InitMessage = { type: "init", backendOverride: requestedBackend(), assetBase };
+      worker.postMessage(init);
+    } catch (error) {
+      console.error("pipeline worker failed to start", error);
+      this.worker = null;
+    }
   }
 
   /** Forcibly kills the worker. This is the actual point of moving the

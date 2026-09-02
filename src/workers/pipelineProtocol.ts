@@ -17,6 +17,13 @@ export interface InitMessage {
    * function's doc comment. `null` means no override: run the normal
    * best-available chain. */
   backendOverride: BackendName | null;
+  /** Absolute base URL for model/WASM fetches, e.g.
+   * `https://projects.scottdrichards.com/boggle/`. Resolved on the main
+   * thread as `new URL(import.meta.env.BASE_URL, location.href).href` —
+   * a relative base only means something against a known document location,
+   * and the worker's own script URL is the wrong one (see `ml/models.ts`'s
+   * `assetBase` doc comment for the bug this fixes). */
+  assetBase: string;
 }
 
 /** One video frame, captured via `createImageBitmap(video)` at the stream's
