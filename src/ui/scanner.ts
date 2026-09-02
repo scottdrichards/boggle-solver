@@ -177,6 +177,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     </div>
     <p class="scanner-error" id="scanner-error" hidden></p>
     <div class="scanner-actions">
+      <button type="button" id="scanner-switch-camera" hidden>Switch camera</button>
       <button type="button" id="scanner-retry" hidden>Retry camera</button>
       <button type="button" id="scanner-review" hidden>Review letters</button>
       <button type="button" id="scanner-report" hidden>Report wrong board</button>
@@ -190,6 +191,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   const overlay = container.querySelector<HTMLCanvasElement>("#scanner-overlay")!;
   const statusEl = container.querySelector<HTMLElement>("#scanner-status")!;
   const errorEl = container.querySelector<HTMLElement>("#scanner-error")!;
+  const switchCameraBtn = container.querySelector<HTMLButtonElement>("#scanner-switch-camera")!;
   const retryBtn = container.querySelector<HTMLButtonElement>("#scanner-retry")!;
   const reviewBtn = container.querySelector<HTMLButtonElement>("#scanner-review")!;
   const reportBtn = container.querySelector<HTMLButtonElement>("#scanner-report")!;
@@ -299,6 +301,16 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   let starting: Promise<void> | null = null;
   /** Deferred camera release scheduled by `lockIn` — see there. */
   let pendingStop: number | null = null;
+  /** Every `videoinput` device seen since the last `getUserMedia` call.
+   * Labels (and a full list at all, on some browsers) only populate once
+   * permission has been granted at least once, so this starts empty and is
+   * refreshed inside `startInner()` after the first successful stream. */
+  let videoDevices: MediaDeviceInfo[] = [];
+  let currentDeviceIndex = -1;
+  /** Set by `switchCamera()`; `null` means "use the default facing-camera
+   * constraint", same as before this feature existed. */
+  let desiredDeviceId: string | null = null;
+  let switchingCamera = false;
   let loopToken = 0;
   let quickLookMisses = 0;
   /** Board size the current run of consensus votes assumes. The fitter picks
@@ -558,6 +570,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       gridSize: state.gridSize,
     };
     reportBtn.hidden = true; // shown once a cell is actually flagged wrong
+    switchCameraBtn.hidden = true; // nothing to switch once the camera stops
 
     wantsToRun = false;
     running = false;
@@ -732,6 +745,72 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
   }
 
+  /** Requests the camera, preferring whatever `desiredDeviceId` was set to by
+   * `switchCamera()` — the same default-facing-camera constraint as before
+   * this feature existed when it's `null`. If the chosen device fails (e.g.
+   * unplugged, or permission for it revoked mid-session), falls back to the
+   * default once rather than leaving the scanner stuck on a dead device until
+   * a reload. */
+  function acquireStream(): Promise<MediaStream> {
+    const base = {
+      // Ask for detail: a die glyph is a small part of the frame, and the
+      // classifier's crops come straight out of it.
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+    };
+    if (!desiredDeviceId) {
+      return navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, ...base },
+        audio: false,
+      });
+    }
+    return navigator.mediaDevices
+      .getUserMedia({ video: { deviceId: { exact: desiredDeviceId }, ...base }, audio: false })
+      .catch(() => {
+        desiredDeviceId = null;
+        return navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, ...base },
+          audio: false,
+        });
+      });
+  }
+
+  /** Refreshes the known camera list and shows/hides the switch button.
+   * `enumerateDevices()` only returns real labels (and, on some browsers, the
+   * full list at all) once permission has been granted at least once, so this
+   * is called after every successful `getUserMedia`, not just at mount. */
+  async function refreshDeviceList(activeStream: MediaStream): Promise<void> {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      videoDevices = devices.filter((d) => d.kind === "videoinput");
+    } catch {
+      videoDevices = [];
+    }
+    const activeId = activeStream.getVideoTracks()[0]?.getSettings().deviceId ?? null;
+    currentDeviceIndex = activeId ? videoDevices.findIndex((d) => d.deviceId === activeId) : -1;
+    switchCameraBtn.hidden = videoDevices.length < 2;
+  }
+
+  /** Cycles to the next known camera (front/back, or a phone's extra rear
+   * lenses) and restarts the stream on it. Only the camera track is torn down
+   * and reacquired — the CV/ML pipeline worker stays warm, and `startInner`'s
+   * own `consensus.reset()` clears votes for the new viewpoint same as any
+   * other restart. */
+  async function switchCamera(): Promise<void> {
+    if (switchingCamera || videoDevices.length < 2) return;
+    switchingCamera = true;
+    switchCameraBtn.disabled = true;
+    currentDeviceIndex = (currentDeviceIndex + 1) % videoDevices.length;
+    desiredDeviceId = videoDevices[currentDeviceIndex]!.deviceId;
+    stop();
+    try {
+      await start();
+    } finally {
+      switchingCamera = false;
+      switchCameraBtn.disabled = false;
+    }
+  }
+
   async function start(): Promise<void> {
     wantsToRun = true;
     if (pendingStop !== null) {
@@ -763,16 +842,7 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
     setStatus("Starting camera…");
 
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          // Ask for detail: a die glyph is a small part of the frame, and the
-          // classifier's crops come straight out of it.
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
-        audio: false,
-      });
+      stream = await acquireStream();
     } catch (error) {
       // Show why, on screen. "Nothing happened" is not a diagnosable report,
       // and the reasons are very different: NotAllowedError is permission (or
@@ -790,11 +860,13 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
       );
       diagnostics.note = `getUserMedia: ${name}`;
       renderDiagnostics();
+      switchCameraBtn.hidden = true;
       startInitiatedAt = null;
       return;
     }
 
     clearError();
+    void refreshDeviceList(stream);
     // Defensive: never overwrite a live stream reference without stopping it.
     video.srcObject = stream;
     // Autoplay can reject; without this the loop would spin on a 0x0 video
@@ -931,6 +1003,10 @@ export function mountScanner(container: HTMLElement, handlers: ScannerHandlers):
   retryBtn.addEventListener("click", () => {
     clearError();
     void start();
+  });
+
+  switchCameraBtn.addEventListener("click", () => {
+    void switchCamera();
   });
 
   reviewBtn.addEventListener("click", () => {
